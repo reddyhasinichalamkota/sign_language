@@ -1,0 +1,3475 @@
+﻿
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\main.py =====
+
+import argparse
+import sys
+import os
+
+# Add workspace directory to path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from src.camera.camera import run_camera_test
+from src.inference.realtime_inference import run_realtime_application
+from src.inference.live_test import run_letter_test
+from src.dataset.dataset_validator import inspect_dataset_directory
+from src.utils.config import resolve_path
+from src.utils.logger import get_logger
+
+logger = get_logger("MainAppLauncher")
+
+def display_interactive_menu():
+    print("\n=======================================================")
+    print("   REAL-TIME INDIAN SIGN LANGUAGE RECOGNITION SYSTEM   ")
+    print("=======================================================")
+    print("Select Operational Mode:")
+    print("  1. Test Laptop Camera Hardware (OpenCV Test)")
+    print("  2. Run Static Sign Recognition (Live OpenCV Webcam)")
+    print("  3. Run Dynamic Sign Recognition (Live OpenCV Webcam)")
+    print("  4. Inspect Static Image Dataset (Dataset/ Directory)")
+    print("  5. Guided Live Letter Test A-Z (saves results CSV)")
+    print("  6. Guided Live Number Test 0-5 (saves results CSV)")
+    print("  Q. Quit Application")
+    print("=======================================================")
+    
+    choice = input("Enter option [1-6 or Q]: ").strip().upper()
+    return choice
+
+def main():
+    parser = argparse.ArgumentParser(description="Real-Time ISL Recognition Launcher")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["camera_test", "static", "dynamic", "inspect", "letter_test", "number_test"],
+        help="Operating mode: camera_test | static | dynamic | inspect | letter_test | number_test"
+    )
+    args = parser.parse_args()
+
+    mode = args.mode
+
+    if not mode:
+        choice = display_interactive_menu()
+        if choice == "1":
+            mode = "camera_test"
+        elif choice == "2":
+            mode = "static"
+        elif choice == "3":
+            mode = "dynamic"
+        elif choice == "4":
+            mode = "inspect"
+        elif choice == "5":
+            mode = "letter_test"
+        elif choice == "6":
+            mode = "number_test"
+        elif choice == "Q":
+            print("Exiting ISL Recognition Application. Goodbye!")
+            return
+        else:
+            print("Invalid option selected. Exiting.")
+            return
+
+    logger.info(f"Launching ISL Recognition System in mode: {mode.upper()}")
+
+    if mode == "camera_test":
+        run_camera_test()
+    elif mode == "static":
+        run_realtime_application(mode="STATIC")
+    elif mode == "dynamic":
+        run_realtime_application(mode="DYNAMIC")
+    elif mode == "letter_test":
+        run_letter_test()
+    elif mode == "number_test":
+        run_letter_test(numbers=True)
+    elif mode == "inspect":
+        training_dir = resolve_path("Dataset/Training")
+        target_dir = training_dir if training_dir.exists() else resolve_path("Dataset")
+        if target_dir.exists():
+            inspect_dataset_directory(target_dir)
+        else:
+            print(f"[ERROR] Dataset directory '{target_dir}' not found.")
+
+if __name__ == "__main__":
+    main()
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\predict_image.py =====
+
+"""
+Identify an ISL sign from an image and show the result in a UI window.
+
+Usage (from the repository root):
+    python src/predict_image.py                    # interactive: drag & drop / paste image paths
+    python src/predict_image.py "Dataset/Testing/A/175.jpg"
+    python src/predict_image.py path/to/image.jpg --no-ui      # print/save only
+
+Pipeline: hand detection (MediaPipe) + static CNN -> label,
+then hand segmentation (GrabCut / skin colour) -> hand shown in WHITE on black,
+then a window with: Original | Hand segmentation | Detected sign.
+Press any key in the window to close it. A copy is saved to evaluation_results/image_predictions/.
+"""
+
+import sys
+import os
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+import argparse
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+from src.inference.gesture_translator import ISLGestureTranslator
+from src.utils.config import resolve_path
+from src.utils.logger import get_logger
+
+logger = get_logger("PredictImage")
+
+PANEL_H = 330
+MAX_WINDOW_W = 1300
+PLACEHOLDERS = ("Keep palm", "Analyzing", "Position hand", "Waiting")
+
+
+def clean_label(label: str) -> str:
+    """"Sign 'W' (WhatsApp)" -> "W (WhatsApp)"; "Sign 'A'" -> "A"."""
+    if label.startswith("Sign '"):
+        letter, _, rest = label[6:].partition("'")
+        return f"{letter}{rest}".strip()
+    return label
+
+
+def skin_mask(img_bgr: np.ndarray) -> np.ndarray:
+    ycrcb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb)
+    m1 = cv2.inRange(ycrcb, (0, 133, 77), (255, 173, 127))
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    m2 = cv2.inRange(hsv, (0, 20, 50), (25, 190, 255))
+    return cv2.bitwise_and(m1, m2)
+
+
+def segment_hand(img_bgr: np.ndarray, bbox) -> np.ndarray:
+    """Binary uint8 mask (255 = hand). GrabCut inside the hand box, skin-colour as fallback."""
+    h, w = img_bgr.shape[:2]
+    if bbox is None:
+        bbox = (0, 0, w, h)
+    x1, y1, x2, y2 = bbox
+    mask = np.zeros((h, w), np.uint8)
+
+    # 1) GrabCut initialised with the hand box
+    try:
+        scale = min(1.0, 480.0 / max(h, w))
+        small = cv2.resize(img_bgr, (int(w * scale), int(h * scale)))
+        rect = (int(x1 * scale), int(y1 * scale), max(2, int((x2 - x1) * scale)), max(2, int((y2 - y1) * scale)))
+        gc = np.zeros(small.shape[:2], np.uint8)
+        bgd, fgd = np.zeros((1, 65), np.float64), np.zeros((1, 65), np.float64)
+        cv2.grabCut(small, gc, rect, bgd, fgd, 5, cv2.GC_INIT_WITH_RECT)
+        fg = np.where((gc == cv2.GC_FGD) | (gc == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+        mask = cv2.resize(fg, (w, h), interpolation=cv2.INTER_NEAREST)
+    except cv2.error:
+        pass
+
+    # 2) Skin-colour fallback if GrabCut gave nothing sensible (<3% or >90% of the box)
+    box_area = max(1, (x2 - x1) * (y2 - y1))
+    frac = cv2.countNonZero(mask[y1:y2, x1:x2]) / box_area
+    if frac < 0.03 or frac > 0.90:
+        mask = np.zeros((h, w), np.uint8)
+        mask[y1:y2, x1:x2] = skin_mask(img_bgr[y1:y2, x1:x2])
+
+    # Clean up: close holes, drop specks, keep the biggest blobs, smooth the edge
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    keep = np.zeros_like(mask)
+    big = [c for c in contours if cv2.contourArea(c) > 0.02 * box_area]
+    cv2.drawContours(keep, big or contours, -1, 255, thickness=cv2.FILLED)
+    return cv2.GaussianBlur(keep, (5, 5), 0)
+
+
+def fit_height(img: np.ndarray, height: int = PANEL_H) -> np.ndarray:
+    h, w = img.shape[:2]
+    return cv2.resize(img, (max(1, int(w * height / h)), height))
+
+
+def titled(panel: np.ndarray, title: str) -> np.ndarray:
+    bar = np.full((34, panel.shape[1], 3), (30, 30, 35), np.uint8)
+    cv2.putText(bar, title, (10, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (230, 230, 230), 1, cv2.LINE_AA)
+    return np.vstack([bar, panel])
+
+
+def predict_and_segment(image_path: str, translator):
+    img = cv2.imread(image_path)
+    if img is None:
+        raise ValueError(f"Could not read image (not a valid image file?): {image_path}")
+
+    translator.history.clear()  # no smoothing carry-over from a previous image
+    annotated, label, conf, top3, bbox, _ = translator.process_frame(img.copy())
+
+    # No usable result from the hand-tracking path: classify the whole image with the CNN
+    if any(label.startswith(p) for p in PLACEHOLDERS) and translator.static_cnn.is_loaded:
+        c_lbl, c_conf, top3 = translator.static_cnn.predict(img)
+        label, conf = f"Sign '{c_lbl}'", c_conf
+
+    mask = segment_hand(img, bbox)
+    return img, annotated, mask, bbox, clean_label(label), conf, top3
+
+
+def build_ui(img, annotated, mask, bbox, label, conf, top3) -> np.ndarray:
+    # Segmentation panel: hand WHITE, everything else black
+    white_hand = np.zeros_like(img)
+    white_hand[mask > 127] = (255, 255, 255)
+
+    # Result panel: background dimmed, hand whitened/highlighted, box drawn
+    dim = (img * 0.25).astype(np.uint8)
+    m3 = (mask.astype(np.float32) / 255.0)[..., None]
+    highlight = (dim * (1 - m3) + (img * 0.35 + 255 * 0.65) * m3).astype(np.uint8)
+    contours, _ = cv2.findContours((mask > 127).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(highlight, contours, -1, (0, 255, 120), 2)
+    if bbox is not None:
+        cv2.rectangle(highlight, bbox[:2], bbox[2:], (0, 220, 255), 2)
+
+    panels = [titled(fit_height(img), "1. Original image"),
+              titled(fit_height(white_hand), "2. Hand segmentation"),
+              titled(fit_height(highlight), "3. Hand highlighted")]
+    row = np.hstack(panels)
+
+    # Result banner
+    banner = np.full((110, row.shape[1], 3), (20, 20, 25), np.uint8)
+    cv2.putText(banner, f"Detected sign:  {label}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 255, 255), 3, cv2.LINE_AA)
+    color = (0, 255, 0) if conf >= 0.7 else (0, 230, 255) if conf >= 0.4 else (120, 180, 255)
+    cv2.putText(banner, f"Confidence: {conf * 100:.1f}%", (20, 92), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+    if top3:
+        t = "   |   ".join(f"{l} {p * 100:.0f}%" for l, p in top3[:3])
+        cv2.putText(banner, f"Top 3: {t}", (row.shape[1] // 2, 92), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 220, 255), 1, cv2.LINE_AA)
+    return np.vstack([row, banner])
+
+
+def clean_path(text: str) -> str:
+    """Accept drag-and-drop / pasted paths: strips quotes, a leading '& ' and surrounding spaces."""
+    t = text.strip()
+    if t.startswith("&"):
+        t = t[1:].strip()
+    return t.strip("\"'").strip()
+
+
+def process_image(path: str, translator, show: bool = True):
+    p = Path(clean_path(path))
+    p = p if p.exists() else resolve_path(str(p))
+    if not p.is_file():
+        print(f"  Image not found: {p}")
+        return
+    try:
+        img, annotated, mask, bbox, label, conf, top3 = predict_and_segment(str(p), translator)
+    except ValueError as e:
+        print(f"  {e}")
+        return
+
+    print(f"\n  Image     : {p}\n  Predicted : {label}\n  Confidence: {conf * 100:.1f}%")
+    if top3:
+        print("  Top 3     : " + ", ".join(f"{l} ({q * 100:.0f}%)" for l, q in top3[:3]))
+
+    ui = build_ui(img, annotated, mask, bbox, label, conf, top3)
+    out_dir = resolve_path("evaluation_results/image_predictions")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_file = out_dir / f"{p.stem}_result.png"
+    cv2.imwrite(str(out_file), ui)
+    print(f"  Saved UI  : {out_file}")
+
+    if show:
+        if ui.shape[1] > MAX_WINDOW_W:  # fit the screen
+            s = MAX_WINDOW_W / ui.shape[1]
+            ui = cv2.resize(ui, (MAX_WINDOW_W, int(ui.shape[0] * s)))
+        win = "ISL Sign Recognition - press any key to close"
+        cv2.imshow(win, ui)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Identify an ISL sign from an image and show a segmentation UI")
+    ap.add_argument("image", nargs="?", help="image path; omit it to paste / drag-and-drop images interactively")
+    ap.add_argument("--no-ui", action="store_true", help="do not open the window")
+    args = ap.parse_args()
+
+    print("Loading models (one moment)...")
+    translator = ISLGestureTranslator()
+    try:
+        if args.image:
+            process_image(args.image, translator, show=not args.no_ui)
+            return
+        print("\n=== ISL Sign Recognition ===")
+        print("Drag & drop an image into this window (or paste its path) and press Enter.")
+        print("Type  q  and press Enter to quit.\n")
+        while True:
+            try:
+                text = input("Image path > ")
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not text.strip():
+                continue
+            if text.strip().lower() in ("q", "quit", "exit"):
+                break
+            process_image(text, translator, show=not args.no_ui)
+            print()
+    finally:
+        translator.close()
+
+
+if __name__ == "__main__":
+    main()
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\__init__.py =====
+
+# ISL Source Package
+__version__ = "1.0.0"
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\camera\camera.py =====
+
+import os
+import cv2
+import time
+from typing import Generator, Tuple, Optional
+from src.utils.logger import get_logger
+from src.utils.config import load_config
+
+logger = get_logger("CameraManager")
+
+class CameraManager:
+    """Handles real-time OpenCV VideoCapture camera interactions."""
+
+    def __init__(self, camera_index: int = 0, width: int = 640, height: int = 480, target_fps: int = 30):
+        self.camera_index = camera_index
+        self.width = width
+        self.height = height
+        self.target_fps = target_fps
+        self.cap: Optional[cv2.VideoCapture] = None
+        self.is_running = False
+
+    def is_available(self) -> bool:
+        """Check if camera hardware is accessible."""
+        test_cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY)
+        if not test_cap.isOpened():
+            test_cap.release()
+            return False
+        ret, frame = test_cap.read()
+        test_cap.release()
+        return ret and frame is not None
+
+    def start(self) -> bool:
+        """Initialize and open OpenCV VideoCapture hardware."""
+        logger.info(f"Opening camera hardware at index {self.camera_index}...")
+        # Use CAP_DSHOW on Windows for fast backend initialization
+        self.cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY)
+        if not self.cap.isOpened():
+            logger.error(f"Failed to open camera at index {self.camera_index}. Hardware unavailable or in use.")
+            return False
+
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        self.cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+
+        actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+
+        logger.info(f"Camera opened successfully! Resolution: {actual_w}x{actual_h}, FPS: {actual_fps}")
+        self.is_running = True
+        return True
+
+    def read_frame(self) -> Tuple[bool, Optional[cv2.Mat]]:
+        """Capture single frame from camera instance."""
+        if not self.cap or not self.cap.isOpened():
+            return False, None
+        ret, frame = self.cap.read()
+        return ret, frame
+
+    def release(self):
+        """Release camera hardware safely."""
+        if self.cap and self.cap.isOpened():
+            self.cap.release()
+            logger.info("Camera hardware released.")
+        self.is_running = False
+        cv2.destroyAllWindows()
+
+def run_camera_test():
+    """Standalone test verifying camera hardware execution."""
+    cfg = load_config()
+    cam_cfg = cfg.get("camera", {})
+    cam = CameraManager(
+        camera_index=cam_cfg.get("index", 0),
+        width=cam_cfg.get("width", 640),
+        height=cam_cfg.get("height", 480),
+        target_fps=cam_cfg.get("fps", 30)
+    )
+
+    print("\n==============================================")
+    print("       TESTING LAPTOP CAMERA HARDWARE         ")
+    print("==============================================")
+    print("Press 'q' in the OpenCV window to exit.\n")
+
+    if not cam.start():
+        print("[ERROR] Could not open camera hardware! Check USB webcam / permissions.")
+        return
+
+    prev_time = time.time()
+    fps = 0.0
+
+    try:
+        while True:
+            ret, frame = cam.read_frame()
+            if not ret or frame is None:
+                print("[ERROR] Failed to grab frame from camera.")
+                break
+
+            curr_time = time.time()
+            fps = 0.9 * fps + 0.1 * (1.0 / (curr_time - prev_time + 1e-6))
+            prev_time = curr_time
+
+            # Status Overlay
+            cv2.putText(frame, f"Camera: Connected | FPS: {fps:.1f}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(frame, "Press 'Q' to quit", (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+            cv2.imshow("ISL Real-Time Camera Test", frame)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                logger.info("Quit key 'q' pressed by user.")
+                break
+    finally:
+        cam.release()
+        print("Camera hardware test complete.")
+
+if __name__ == "__main__":
+    run_camera_test()
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\dataset\dataset_loader.py =====
+
+"""
+Static image dataset loading for training/evaluation.
+
+Uses the same tf.keras.utils.image_dataset_from_directory settings as train_cnn.py
+(the script that produced model/custom_cnn.tflite): RGB uint8->float32 pixels in
+[0, 255], integer labels, class indices from alphabetically sorted folder names.
+"""
+
+from pathlib import Path
+from typing import List, Optional, Tuple, Union
+
+from src.utils.logger import get_logger
+
+logger = get_logger("DatasetLoader")
+
+PathLike = Union[str, Path]
+
+
+def _load_split(directory: PathLike, img_size: Tuple[int, int], batch_size: int, shuffle: bool, seed: int):
+    import tensorflow as tf
+
+    return tf.keras.utils.image_dataset_from_directory(
+        str(directory),
+        image_size=img_size,
+        batch_size=batch_size,
+        label_mode="int",
+        shuffle=shuffle,
+        seed=seed,
+    )
+
+
+def load_static_tensorflow_datasets(
+    train_dir: PathLike,
+    val_dir: Optional[PathLike] = None,
+    test_dir: Optional[PathLike] = None,
+    img_size: Tuple[int, int] = (224, 224),
+    batch_size: int = 32,
+    seed: int = 42,
+) -> Tuple[object, Optional[object], Optional[object], List[str]]:
+    """
+    Load Training (shuffled) and optional Validation/Testing (unshuffled) splits.
+    Returns (train_ds, val_ds, test_ds, class_names). Raises FileNotFoundError for a
+    missing directory and ValueError if the splits do not share identical class folders,
+    which would silently misalign label indices between splits.
+    """
+    for d in (train_dir, val_dir, test_dir):
+        if d is not None and not Path(d).is_dir():
+            raise FileNotFoundError(f"Dataset directory not found: {d}")
+
+    train_ds = _load_split(train_dir, img_size, batch_size, shuffle=True, seed=seed)
+    class_names = list(train_ds.class_names)
+
+    val_ds = test_ds = None
+    if val_dir is not None:
+        val_ds = _load_split(val_dir, img_size, batch_size, shuffle=False, seed=seed)
+        if list(val_ds.class_names) != class_names:
+            raise ValueError(f"Validation classes {val_ds.class_names} differ from training classes {class_names}")
+    if test_dir is not None:
+        test_ds = _load_split(test_dir, img_size, batch_size, shuffle=False, seed=seed)
+        if list(test_ds.class_names) != class_names:
+            raise ValueError(f"Testing classes {test_ds.class_names} differ from training classes {class_names}")
+
+    logger.info(f"Loaded static datasets with {len(class_names)} classes: {class_names}")
+    return train_ds, val_ds, test_ds, class_names
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\dataset\dataset_validator.py =====
+
+"""
+Static image dataset integrity checks.
+
+Consolidates the logic of the original standalone analysis scripts
+(isl_dataset_analysis.py, isl_leakage_check.py) so it can be reused by
+src/main.py (--mode inspect) and the unit tests.
+"""
+
+import hashlib
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, List, Tuple, Union
+
+from PIL import Image, UnidentifiedImageError
+
+from src.utils.logger import get_logger
+
+logger = get_logger("DatasetValidator")
+
+IMG_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}
+SPLITS = ["Training", "Validation", "Testing"]
+
+PathLike = Union[str, Path]
+
+
+def _iter_images(root: PathLike):
+    """Yield every image file under root (recursive), in a deterministic order."""
+    root = Path(root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"Dataset directory not found: {root}")
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and path.suffix.lower() in IMG_EXTENSIONS:
+            yield path
+
+
+def hash_file(path: PathLike) -> str:
+    """Return the MD5 hex digest of a file's bytes (same scheme as isl_leakage_check.py)."""
+    with open(path, "rb") as f:
+        return hashlib.md5(f.read()).hexdigest()
+
+
+def find_corrupted_images(root: PathLike) -> List[Tuple[str, str]]:
+    """Return [(path, error_message)] for every image under root that PIL cannot verify."""
+    corrupted = []
+    for path in _iter_images(root):
+        try:
+            with Image.open(path) as im:
+                im.verify()
+        except (UnidentifiedImageError, OSError, SyntaxError) as e:
+            corrupted.append((str(path), str(e)))
+    return corrupted
+
+
+def find_duplicate_images(root: PathLike) -> Dict[str, List[str]]:
+    """Return {md5: [paths]} for byte-identical images that occur more than once under root."""
+    hash_map: Dict[str, List[str]] = defaultdict(list)
+    for path in _iter_images(root):
+        hash_map[hash_file(path)].append(str(path))
+    return {h: paths for h, paths in hash_map.items() if len(paths) > 1}
+
+
+def find_cross_split_leaks(base_dir: PathLike, splits: List[str] = SPLITS) -> Dict[str, List[Tuple[str, str]]]:
+    """Return {md5: [(split, path)]} for images that appear in more than one split folder."""
+    base_dir = Path(base_dir)
+    hash_map: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+    for split in splits:
+        split_dir = base_dir / split
+        if not split_dir.is_dir():
+            logger.warning(f"Split folder not found, skipping: {split_dir}")
+            continue
+        for path in _iter_images(split_dir):
+            hash_map[hash_file(path)].append((split, str(path)))
+    return {h: locs for h, locs in hash_map.items() if len({s for s, _ in locs}) > 1}
+
+
+def count_images_per_class(split_dir: PathLike) -> Dict[str, int]:
+    """Return {class_folder_name: image_count} for the immediate class folders of split_dir."""
+    split_dir = Path(split_dir)
+    if not split_dir.is_dir():
+        raise FileNotFoundError(f"Split directory not found: {split_dir}")
+    counts = {}
+    for class_dir in sorted(p for p in split_dir.iterdir() if p.is_dir()):
+        counts[class_dir.name] = sum(
+            1 for p in class_dir.iterdir() if p.is_file() and p.suffix.lower() in IMG_EXTENSIONS
+        )
+    return counts
+
+
+def inspect_dataset_directory(target_dir: PathLike) -> Dict[str, object]:
+    """
+    Print and return a summary of a class-folder image dataset:
+    per-class counts, empty classes, corrupted files and within-directory duplicates.
+    """
+    target_dir = Path(target_dir)
+    counts = count_images_per_class(target_dir)
+    corrupted = find_corrupted_images(target_dir)
+    duplicates = find_duplicate_images(target_dir)
+    empty = [c for c, n in counts.items() if n == 0]
+
+    print("\n==============================================")
+    print(f" DATASET INSPECTION: {target_dir}")
+    print("==============================================")
+    for cls, n in counts.items():
+        print(f"  {cls:<12} {n:>6} images")
+    print(f"  {'TOTAL':<12} {sum(counts.values()):>6} images across {len(counts)} classes")
+    print(f"\n  Empty classes      : {empty if empty else 'none'}")
+    print(f"  Corrupted images   : {len(corrupted)}")
+    for path, err in corrupted[:10]:
+        print(f"    - {path} ({err})")
+    print(f"  Duplicate groups   : {len(duplicates)}")
+    print("==============================================\n")
+
+    return {
+        "class_counts": counts,
+        "empty_classes": empty,
+        "corrupted": corrupted,
+        "duplicates": duplicates,
+    }
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\dataset\split_dataset.py =====
+
+"""
+Stratified train/val/test splitting for manifest DataFrames (e.g. dynamic_video_splits.csv),
+plus a check for recording-level leakage across splits.
+
+split_dataframe_stratified reproduces the per-file 70/15/15 procedure used to create
+dynamic_video_splits.csv (dynamic_datapreprocessing.py, cell 0).
+"""
+
+import re
+from pathlib import PureWindowsPath
+from typing import Dict, List, Tuple
+
+import pandas as pd
+from sklearn.model_selection import train_test_split
+
+
+def split_dataframe_stratified(
+    df: pd.DataFrame,
+    label_column: str = "class_label",
+    train_ratio: float = 0.70,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    random_state: int = 42,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Split df into stratified train/val/test frames, each tagged with a 'split' column."""
+    if abs(train_ratio + val_ratio + test_ratio - 1.0) > 1e-6:
+        raise ValueError(f"Split ratios must sum to 1.0, got {train_ratio + val_ratio + test_ratio}")
+    if label_column not in df.columns:
+        raise KeyError(f"Label column '{label_column}' not found in DataFrame columns {list(df.columns)}")
+
+    train_df, temp_df = train_test_split(
+        df, test_size=(val_ratio + test_ratio), stratify=df[label_column], random_state=random_state
+    )
+    relative_test_ratio = test_ratio / (val_ratio + test_ratio)
+    val_df, test_df = train_test_split(
+        temp_df, test_size=relative_test_ratio, stratify=temp_df[label_column], random_state=random_state
+    )
+
+    train_df = train_df.copy()
+    val_df = val_df.copy()
+    test_df = test_df.copy()
+    train_df["split"] = "train"
+    val_df["split"] = "val"
+    test_df["split"] = "test"
+    return train_df, val_df, test_df
+
+
+# Augmentation suffixes observed in Video_Dataset file names, e.g.
+#   WIN_20231102_12_42_54_Pro.mp4 / ..._Pro_left_tilt.mp4 / ..._Pro_Trim_cropped_right_tilt.mp4
+_AUGMENT_SUFFIX = re.compile(r"(_Trim)?(_cropped)?(_(left|right)_tilt)?$")
+
+
+def recording_id_from_path(video_path: str) -> str:
+    """Return '<class>/<base recording>' with augmentation suffixes (tilt/trim/crop) removed."""
+    p = PureWindowsPath(video_path)
+    stem = _AUGMENT_SUFFIX.sub("", p.stem)
+    return f"{p.parent.name}/{stem}"
+
+
+def split_dataframe_grouped_stratified(
+    df: pd.DataFrame,
+    label_column: str = "class_label",
+    path_column: str = "video_path",
+    train_ratio: float = 0.70,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """
+    Leakage-free split: whole source recordings (all augmented variants together) are
+    assigned to one split, stratified per class. Returns df with a 'split' column.
+    """
+    if abs(train_ratio + val_ratio + test_ratio - 1.0) > 1e-6:
+        raise ValueError(f"Split ratios must sum to 1.0, got {train_ratio + val_ratio + test_ratio}")
+    df = df.drop(columns=["split"], errors="ignore").copy()
+    df["_recording"] = df[path_column].map(recording_id_from_path)
+    if (df.groupby("_recording")[label_column].nunique() > 1).any():
+        raise ValueError("A recording id maps to more than one class label")
+
+    assignment = {}
+    for _, cls_df in df.groupby(label_column, sort=True):
+        recordings = pd.Series(sorted(cls_df["_recording"].unique()))
+        recordings = recordings.sample(frac=1.0, random_state=random_state).tolist()
+        n_val = int(round(len(recordings) * val_ratio))
+        n_test = int(round(len(recordings) * test_ratio))
+        n_train = len(recordings) - n_val - n_test
+        for i, rid in enumerate(recordings):
+            assignment[rid] = "train" if i < n_train else ("val" if i < n_train + n_val else "test")
+
+    df["split"] = df["_recording"].map(assignment)
+    order = {"train": 0, "val": 1, "test": 2}
+    df = df.sort_values(["split", label_column, path_column], key=lambda s: s.map(order) if s.name == "split" else s)
+    return df.drop(columns=["_recording"]).reset_index(drop=True)
+
+
+def find_cross_split_recordings(df: pd.DataFrame, path_column: str = "video_path") -> Dict[str, List[str]]:
+    """Return {recording_id: sorted splits} for source recordings whose variants occur in more than one split."""
+    groups: Dict[str, set] = {}
+    for path, split in zip(df[path_column], df["split"]):
+        groups.setdefault(recording_id_from_path(path), set()).add(split)
+    return {rid: sorted(s) for rid, s in groups.items() if len(s) > 1}
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\dataset\__init__.py =====
+
+# Dataset package: static dataset validation, loading and split utilities
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\inference\actions.py =====
+
+"""
+Sign-triggered desktop actions: holding a configured static sign for `hold_seconds`
+opens the mapped app/website (e.g. W -> WhatsApp, Y -> YouTube, L -> Google).
+
+The sign -> action table comes from config.yaml (actions.signs). Only http(s) URLs and the
+whatsapp: protocol are accepted, so a config typo cannot launch arbitrary programs.
+"""
+
+import re
+import subprocess
+import webbrowser
+from dataclasses import dataclass
+from typing import Callable, Dict, Optional, Tuple
+
+from src.utils.logger import get_logger
+
+logger = get_logger("SignActions")
+
+DEFAULT_ACTIONS = {
+    "W": {"name": "WhatsApp", "url": "https://web.whatsapp.com"},
+    "Y": {"name": "YouTube", "url": "https://www.youtube.com"},
+    "L": {"name": "Google", "url": "https://www.google.com"},
+}
+
+_SIGN_LETTER = re.compile(r"Sign '([^']+)'")
+
+
+def sign_key(label: str) -> Optional[str]:
+    """Extract the sign key from a display label: "Sign 'W' (WhatsApp)" -> "W"; other labels -> None."""
+    m = _SIGN_LETTER.search(label or "")
+    return m.group(1).strip().upper() if m else None
+
+
+def open_url(url: str) -> bool:
+    """Open a URL in the default browser (falls back to the Windows shell for whatsapp:)."""
+    if url.startswith("whatsapp:"):
+        subprocess.Popen(["cmd", "/c", "start", "", url])
+        return True
+    return bool(webbrowser.open(url))
+
+
+@dataclass
+class SignAction:
+    key: str
+    name: str
+    url: str
+
+
+class SignActionTrigger:
+    """Tracks how long one mapped sign has been held and fires its action once per cooldown."""
+
+    def __init__(self, signs: Optional[Dict[str, Dict[str, str]]] = None, hold_seconds: float = 1.0,
+                 cooldown_seconds: float = 5.0, min_confidence: float = 0.70,
+                 opener: Callable[[str], bool] = open_url):
+        self.actions: Dict[str, SignAction] = {}
+        for key, spec in (signs if signs is not None else DEFAULT_ACTIONS).items():
+            url = str(spec["url"])
+            if not (url.startswith("https://") or url.startswith("http://") or url.startswith("whatsapp:")):
+                raise ValueError(f"Action for sign '{key}' has unsupported URL '{url}' (http(s):// or whatsapp: only)")
+            self.actions[str(key).upper()] = SignAction(str(key).upper(), str(spec.get("name", key)), url)
+        self.hold_seconds = hold_seconds
+        self.cooldown_seconds = cooldown_seconds
+        self.min_confidence = min_confidence
+        self._opener = opener
+        self._held_key: Optional[str] = None
+        self._held_since = 0.0
+        self._last_fired = -1e9
+
+    def update(self, label: str, confidence: float, now: float) -> Tuple[Optional[SignAction], float, Optional[SignAction]]:
+        """
+        Feed the current prediction. Returns (action being held or None, hold progress 0..1,
+        action fired on this call or None).
+        """
+        key = sign_key(label)
+        action = self.actions.get(key) if key else None
+        if action is None or confidence < self.min_confidence:
+            self._held_key = None
+            return None, 0.0, None
+        if key != self._held_key:
+            self._held_key, self._held_since = key, now
+        progress = min(1.0, (now - self._held_since) / self.hold_seconds) if self.hold_seconds > 0 else 1.0
+        if progress >= 1.0 and now - self._last_fired > self.cooldown_seconds:
+            self._last_fired = now
+            self._held_key = None
+            try:
+                self._opener(action.url)
+                logger.info(f"Sign '{key}' held -> opened {action.name} ({action.url})")
+            except OSError as e:
+                logger.error(f"Failed to open {action.name}: {e}")
+            return action, 0.0, action
+        return action, progress, None
+
+
+def build_trigger_from_config(cfg: dict) -> Optional[SignActionTrigger]:
+    """Create the trigger from the config 'actions' section; None when disabled."""
+    a = cfg.get("actions", {}) or {}
+    if not a.get("enabled", True):
+        return None
+    return SignActionTrigger(
+        signs=a.get("signs") or DEFAULT_ACTIONS,
+        hold_seconds=float(a.get("hold_seconds", 1.0)),
+        cooldown_seconds=float(a.get("cooldown_seconds", 5.0)),
+        min_confidence=float(a.get("min_confidence", 0.70)),
+    )
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\inference\dynamic_inference.py =====
+
+import numpy as np
+from pathlib import Path
+from typing import Tuple, Optional, Union, List
+from src.preprocessing.video_preprocessing import preprocess_video_sequence
+from src.utils.class_mapping import ClassMappingManager
+from src.utils.config import resolve_path
+from src.utils.logger import get_logger
+
+logger = get_logger("DynamicInferenceEngine")
+
+# No trained dynamic model exists in the repository. src/training/train_dynamic.py only
+# builds an untrained architecture. A trained model placed here must accept raw RGB
+# frames in [0, 255] shaped (batch, T, H, W, 3), like the src/models builders.
+DEFAULT_DYNAMIC_MODEL = "models/dynamic/dynamic_model.keras"
+DEFAULT_DYNAMIC_MAPPING = "models/dynamic/class_mapping.json"
+
+
+class DynamicInferenceEngine:
+    """Inference engine for dynamic sequence ISL recognition (Keras CNN + Bi-GRU/LSTM model)."""
+
+    def __init__(self, model_path: str = DEFAULT_DYNAMIC_MODEL, mapping_path: str = DEFAULT_DYNAMIC_MAPPING,
+                 strict: bool = False):
+        """
+        strict=False leaves is_loaded=False (with load_error set) when the artifact is missing
+        or invalid; strict=True raises instead.
+        """
+        self.model_path = str(resolve_path(model_path))
+        self.mapping_path = str(resolve_path(mapping_path))
+        self.model = None
+        self.mapping: Optional[ClassMappingManager] = None
+        self.is_loaded = False
+        self.load_error: Optional[str] = None
+        self.sequence_length: Optional[int] = None
+        self.frame_size: Tuple[int, int] = (224, 224)
+        self.num_classes = 0
+        try:
+            self._load()
+        except (FileNotFoundError, ValueError, OSError) as e:
+            self.load_error = str(e)
+            self.is_loaded = False
+            if strict:
+                raise
+            logger.warning(f"Dynamic model unavailable: {e}")
+
+    def _load(self):
+        if not Path(self.model_path).exists():
+            raise FileNotFoundError(f"Dynamic model file not found: {self.model_path}")
+        self.mapping = ClassMappingManager.load_json(self.mapping_path)
+
+        import tensorflow as tf
+        self.model = tf.keras.models.load_model(self.model_path)
+        in_shape = tuple(self.model.input_shape)
+        out_shape = tuple(self.model.output_shape)
+        if len(in_shape) != 5 or in_shape[4] != 3:
+            raise ValueError(f"Dynamic model input shape {in_shape} is not (batch, T, H, W, 3)")
+        if in_shape[1] is None:
+            raise ValueError("Dynamic model has no fixed sequence length; cannot determine frames to sample")
+        self.sequence_length = int(in_shape[1])
+        self.frame_size = (int(in_shape[2]), int(in_shape[3]))
+        self.num_classes = int(out_shape[-1])
+        if self.num_classes != self.mapping.num_classes():
+            raise ValueError(
+                f"Dynamic model outputs {self.num_classes} classes but {self.mapping_path} "
+                f"maps {self.mapping.num_classes()} labels"
+            )
+        self.is_loaded = True
+        logger.info(f"Dynamic model loaded from {self.model_path} | input {in_shape} -> {self.num_classes} classes")
+
+    def _probabilities(self, sequence_input: Union[np.ndarray, List[np.ndarray], str]) -> np.ndarray:
+        seq_tensor = preprocess_video_sequence(
+            sequence_input,
+            target_len=self.sequence_length,
+            target_size=self.frame_size,
+            normalize=False
+        ).astype(np.float32)
+        batch_seq = np.expand_dims(seq_tensor, axis=0)
+
+        preds = np.asarray(self.model(batch_seq, training=False))[0]
+        if preds.shape != (self.num_classes,) or not np.all(np.isfinite(preds)):
+            raise RuntimeError(f"Invalid dynamic model output (shape {preds.shape})")
+        return preds
+
+    def predict_sequence(self, sequence_input: Union[np.ndarray, List[np.ndarray], str]) -> Tuple[str, float]:
+        """
+        Run dynamic sequence prediction on a video path or list/array of RGB frames.
+        The sequence length and frame size come from the loaded model's input shape.
+        Returns Tuple: (Predicted_Sign_Label, Softmax_Confidence)
+        """
+        if not self.is_loaded:
+            return "Waiting for trained model...", 0.0
+        preds = self._probabilities(sequence_input)
+        max_idx = int(np.argmax(preds))
+        return self.mapping.get_label(max_idx), float(preds[max_idx])
+
+    def predict(self, sequence_input: Union[np.ndarray, List[np.ndarray], str]) -> Tuple[str, float, List[Tuple[str, float]]]:
+        """Same as predict_sequence plus the top-3 (label, probability) list (live-matcher interface)."""
+        if not self.is_loaded:
+            return "Waiting for trained model...", 0.0, []
+        preds = self._probabilities(sequence_input)
+        order = np.argsort(preds)[::-1][:3]
+        top3 = [(self.mapping.get_label(int(i)), float(preds[i])) for i in order]
+        return top3[0][0], top3[0][1], top3
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\inference\gesture_translator.py =====
+
+import cv2
+import time
+import math
+import collections
+import numpy as np
+import os
+
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+
+from src.inference.static_inference import StaticInferenceEngine
+from src.utils.config import resolve_path
+from src.utils.logger import get_logger
+
+logger = get_logger("GestureTranslator")
+
+# Hand landmark indices
+WRIST = 0
+THUMB_CMC = 1
+THUMB_MCP = 2
+THUMB_IP = 3
+THUMB_TIP = 4
+INDEX_MCP = 5
+INDEX_PIP = 6
+INDEX_DIP = 7
+INDEX_TIP = 8
+MIDDLE_MCP = 9
+MIDDLE_PIP = 10
+MIDDLE_DIP = 11
+MIDDLE_TIP = 12
+RING_MCP = 13
+RING_PIP = 14
+RING_DIP = 15
+RING_TIP = 16
+PINKY_MCP = 17
+PINKY_PIP = 18
+PINKY_DIP = 19
+PINKY_TIP = 20
+
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),        # Thumb
+    (0, 5), (5, 6), (6, 7), (7, 8),        # Index
+    (5, 9), (9, 10), (10, 11), (11, 12),   # Middle
+    (9, 13), (13, 14), (14, 15), (15, 16), # Ring
+    (13, 17), (17, 18), (18, 19), (19, 20),# Pinky
+    (0, 17)                                # Palm base
+]
+
+
+def smooth_predictions(history) -> str:
+    """Majority vote over recent labels; ties go to the label seen first in the window."""
+    if not history:
+        return ""
+    return collections.Counter(history).most_common(1)[0][0]
+
+
+class ISLGestureTranslator:
+    """
+    Real-time ISL Gesture Recognition and Hand Tracking Engine.
+    Combines MediaPipe 21-landmark geometric classification with the trained CNN model
+    and skin-contour fallback when the hand is close or palm is partially occluded.
+    """
+
+    def __init__(self, model_task_path: str = "gesture_recognizer.task"):
+        self.model_task_path = str(resolve_path(model_task_path))
+        self.recognizer = None
+        self.static_cnn = StaticInferenceEngine()
+        self.history = collections.deque(maxlen=3)
+        self.last_bbox = None
+        self.last_bbox_age = 0
+        self.numbers_mode = False  # True: one-hand finger counting 0-5 instead of letters
+        self._init_recognizer()
+
+    def _init_recognizer(self):
+        if not os.path.exists(self.model_task_path):
+            logger.warning(f"Task model {self.model_task_path} not found. Will use fallback detection.")
+            return
+
+        try:
+            base_options = python.BaseOptions(model_asset_path=self.model_task_path)
+            options = vision.GestureRecognizerOptions(
+                base_options=base_options,
+                num_hands=2,  # ISL fingerspelling mostly uses two hands
+                min_hand_detection_confidence=0.15,
+                min_hand_presence_confidence=0.15,
+                min_tracking_confidence=0.15
+            )
+            self.recognizer = vision.GestureRecognizer.create_from_options(options)
+            logger.info("MediaPipe Gesture Recognizer initialized (confidence=0.15, ultra-responsive) successfully!")
+        except Exception as e:
+            logger.error(f"Failed to initialize MediaPipe recognizer: {e}")
+            self.recognizer = None
+
+    def close(self):
+        """Release the MediaPipe recognizer explicitly (its destructor fails during interpreter shutdown)."""
+        if self.recognizer is not None:
+            self.recognizer.close()
+            self.recognizer = None
+
+    def count_raised_fingers(self, lm) -> int:
+        """
+        Number of extended fingers (0-5) on one hand, scale-invariant: a finger is raised when
+        its tip is clearly farther from the wrist than its PIP joint; the thumb is raised when
+        its tip is far from the index knuckle relative to palm size.
+        """
+        palm = self.dist(lm[WRIST], lm[MIDDLE_MCP]) + 1e-6
+        count = 0
+        for tip, pip in ((INDEX_TIP, INDEX_PIP), (MIDDLE_TIP, MIDDLE_PIP), (RING_TIP, RING_PIP), (PINKY_TIP, PINKY_PIP)):
+            if self.dist(lm[tip], lm[WRIST]) > 1.16 * self.dist(lm[pip], lm[WRIST]):
+                count += 1
+        if self.dist(lm[THUMB_TIP], lm[INDEX_MCP]) / palm > 0.55 and                 self.dist(lm[THUMB_TIP], lm[PINKY_MCP]) > self.dist(lm[THUMB_IP], lm[PINKY_MCP]):
+            count += 1
+        return count
+
+    def dist(self, p1, p2):
+        return math.hypot(p1.x - p2.x, p1.y - p2.y)
+
+    def classify_geometric_landmarks(self, lm, handedness="Right"):
+        """
+        Classifies hand sign based on 21 3D hand landmarks.
+        Uses rotation-invariant finger-to-palm ratios for instant, tilt-independent recognition.
+        Recognizes: Thumbs Up, Thumbs Down, V (Peace), W (WhatsApp), B (Open Palm),
+        A (Fist), D (Point/One), L, Y (Call/Phone), I, F (OK), I Love You, C.
+        """
+        d_wrist_index_tip = self.dist(lm[INDEX_TIP], lm[WRIST])
+        d_wrist_index_pip = self.dist(lm[INDEX_PIP], lm[WRIST])
+        index_ratio = d_wrist_index_tip / (d_wrist_index_pip + 1e-6)
+        index_extended = (index_ratio > 1.16) or (lm[INDEX_TIP].y < lm[INDEX_PIP].y and d_wrist_index_tip > d_wrist_index_pip)
+
+        d_wrist_mid_tip = self.dist(lm[MIDDLE_TIP], lm[WRIST])
+        d_wrist_mid_pip = self.dist(lm[MIDDLE_PIP], lm[WRIST])
+        mid_ratio = d_wrist_mid_tip / (d_wrist_mid_pip + 1e-6)
+        middle_extended = (mid_ratio > 1.16) or (lm[MIDDLE_TIP].y < lm[MIDDLE_PIP].y and d_wrist_mid_tip > d_wrist_mid_pip)
+
+        d_wrist_ring_tip = self.dist(lm[RING_TIP], lm[WRIST])
+        d_wrist_ring_pip = self.dist(lm[RING_PIP], lm[WRIST])
+        ring_ratio = d_wrist_ring_tip / (d_wrist_ring_pip + 1e-6)
+        ring_extended = (ring_ratio > 1.16) or (lm[RING_TIP].y < lm[RING_PIP].y and d_wrist_ring_tip > d_wrist_ring_pip)
+
+        d_wrist_pinky_tip = self.dist(lm[PINKY_TIP], lm[WRIST])
+        d_wrist_pinky_pip = self.dist(lm[PINKY_PIP], lm[WRIST])
+        pinky_ratio = d_wrist_pinky_tip / (d_wrist_pinky_pip + 1e-6)
+        pinky_extended = (pinky_ratio > 1.16) or (lm[PINKY_TIP].y < lm[PINKY_PIP].y and d_wrist_pinky_tip > d_wrist_pinky_pip)
+
+        # Thumb extension
+        thumb_tip = lm[THUMB_TIP]
+        thumb_ip = lm[THUMB_IP]
+        thumb_mcp = lm[THUMB_MCP]
+        wrist = lm[WRIST]
+
+        thumb_up = (thumb_tip.y < thumb_mcp.y) and (thumb_tip.y < lm[INDEX_MCP].y)
+        thumb_down = (thumb_tip.y > thumb_mcp.y) and (thumb_tip.y > wrist.y)
+        thumb_out = self.dist(thumb_tip, lm[INDEX_MCP]) > 0.11
+
+        d_index_middle = self.dist(lm[INDEX_TIP], lm[MIDDLE_TIP])
+        d_thumb_index = self.dist(thumb_tip, lm[INDEX_TIP])
+
+        all_four_curled = (not index_extended) and (not middle_extended) and (not ring_extended) and (not pinky_extended)
+        all_four_up = index_extended and middle_extended and ring_extended and pinky_extended
+
+        # 1. THUMBS UP
+        if thumb_up and all_four_curled:
+            return "Thumbs Up", 0.98
+
+        # 2. THUMBS DOWN
+        if thumb_down and all_four_curled:
+            return "Thumbs Down", 0.98
+
+        # 3. SIGN V (VICTORY / PEACE / TWO)
+        if index_extended and middle_extended and (not ring_extended) and (not pinky_extended):
+            if d_index_middle > 0.035:
+                return "Sign 'V' (Peace / Two)", 0.97
+            else:
+                return "Sign 'U'", 0.92
+
+        # 4. SIGN W (WHATSAPP / THREE FINGERS)
+        if index_extended and middle_extended and ring_extended and (not pinky_extended):
+            return "Sign 'W' (WhatsApp)", 0.98
+
+        # 5. SIGN D (POINTING UP / ONE)
+        if index_extended and (not middle_extended) and (not ring_extended) and (not pinky_extended):
+            if thumb_out and abs(thumb_tip.x - lm[INDEX_TIP].x) > 0.10:
+                return "Sign 'L'", 0.95
+            return "Sign 'D' (One / Point)", 0.95
+
+        # 6. SIGN L
+        if index_extended and thumb_out and (not middle_extended) and (not ring_extended) and (not pinky_extended):
+            return "Sign 'L'", 0.96
+
+        # 7. SIGN Y (CALL / PHONE / SHAKA)
+        if thumb_out and pinky_extended and (not index_extended) and (not middle_extended) and (not ring_extended):
+            return "Sign 'Y' (Call / Phone)", 0.96
+
+        # 8. I LOVE YOU / ROCK
+        if thumb_out and index_extended and pinky_extended and (not middle_extended) and (not ring_extended):
+            return "Sign 'I Love You'", 0.97
+        if index_extended and pinky_extended and (not middle_extended) and (not ring_extended):
+            return "Rock / Love", 0.94
+
+        # 9. SIGN I (PINKY ONLY)
+        if pinky_extended and (not index_extended) and (not middle_extended) and (not ring_extended) and (not thumb_out):
+            return "Sign 'I'", 0.93
+
+        # 10. SIGN F / OK SIGN
+        if d_thumb_index < 0.055 and middle_extended and ring_extended and pinky_extended:
+            return "Sign 'F' (OK Sign)", 0.96
+
+        # 11. SIGN B (OPEN PALM / HELLO)
+        if all_four_up:
+            return "Sign 'B' (Open Hand / Hello)", 0.96
+
+        # 12. SIGN A (CLOSED FIST)
+        if all_four_curled and not thumb_up and not thumb_down:
+            return "Sign 'A' (Fist)", 0.92
+
+        # 13. SIGN C (Curved fingers forming 'C' arc)
+        if (not all_four_curled) and (not all_four_up):
+            if 0.07 < d_thumb_index < 0.22 and (lm[INDEX_TIP].y > lm[INDEX_PIP].y or lm[INDEX_DIP].y > lm[INDEX_PIP].y):
+                return "Sign 'C'", 0.88
+
+        return None, 0.0
+
+    def detect_skin_hand_roi(self, frame_bgr):
+        """
+        Fast skin-color contour detection as a robust fallback.
+        Suppresses upper-center face region to avoid mistaking the user's face for a hand.
+        """
+        H, W, _ = frame_bgr.shape
+        ycrcb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2YCrCb)
+        lower_skin = np.array([0, 133, 77], dtype=np.uint8)
+        upper_skin = np.array([255, 173, 127], dtype=np.uint8)
+        mask = cv2.inRange(ycrcb, lower_skin, upper_skin)
+
+        # Morphological clean up
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        large_contours = [c for c in contours if cv2.contourArea(c) > 4000]
+
+        if not large_contours:
+            return None
+
+        # Prioritize contours outside the top-center face zone
+        hand_candidates = []
+        for c in large_contours:
+            M = cv2.moments(c)
+            if M["m00"] > 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                is_face = (cy < 0.38 * H) and (0.28 * W < cx < 0.72 * W)
+                if not is_face:
+                    hand_candidates.append(c)
+
+        selected_contour = max(hand_candidates, key=cv2.contourArea) if hand_candidates else max(large_contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(selected_contour)
+
+        # Expand padding
+        pad = 20
+        x1 = max(0, x - pad)
+        y1 = max(0, y - pad)
+        x2 = min(W, x + w + pad)
+        y2 = min(H, y + h + pad)
+
+        return (x1, y1, x2, y2)
+
+    def process_frame(self, frame_bgr):
+        """
+        Process a single live webcam frame:
+        1. Runs MediaPipe hand detection (high-sensitivity 0.15).
+        2. If MediaPipe succeeds -> 3D landmarks + geometric recognition.
+        3. If MediaPipe misses -> skin contour + CNN fallback.
+        Returns:
+            processed_frame, prediction_label, confidence, top3_list, hand_bbox, distance_hint
+        """
+        h, w, _ = frame_bgr.shape
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        # Unannotated copy for CNN crops: the overlays below are drawn onto frame_bgr in place
+        clean_bgr = frame_bgr.copy()
+
+        pred_label = "Position hand 1-2 ft away"
+        pred_conf = 0.0
+        top3_list = []
+        hand_bbox = None
+
+        media_pipe_found = False
+
+        if self.recognizer is not None:
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+            result = self.recognizer.recognize(mp_image)
+
+            if result.hand_landmarks:
+                media_pipe_found = True
+                hands = result.hand_landmarks
+                landmarks = hands[0]
+
+                # Bounding box around ALL detected hands (two-handed ISL letters need both in the crop)
+                xs = [lm.x * w for hand in hands for lm in hand]
+                ys = [lm.y * h for hand in hands for lm in hand]
+                xmin = max(0, int(min(xs)) - 25)
+                xmax = min(w, int(max(xs)) + 25)
+                ymin = max(0, int(min(ys)) - 25)
+                ymax = min(h, int(max(ys)) + 25)
+                hand_bbox = (xmin, ymin, xmax, ymax)
+                self.last_bbox = hand_bbox
+                self.last_bbox_age = 0
+
+                # 1. Draw Skeleton Bones & Landmarks for every hand
+                for hand in hands:
+                    for start_idx, end_idx in HAND_CONNECTIONS:
+                        pt1 = (int(hand[start_idx].x * w), int(hand[start_idx].y * h))
+                        pt2 = (int(hand[end_idx].x * w), int(hand[end_idx].y * h))
+                        cv2.line(frame_bgr, pt1, pt2, (0, 255, 128), 2)
+                    for idx, lm in enumerate(hand):
+                        cx, cy = int(lm.x * w), int(lm.y * h)
+                        pt_color = (255, 255, 0) if idx in (4, 8, 12, 16, 20) else (0, 220, 255)
+                        cv2.circle(frame_bgr, (cx, cy), 5, pt_color, -1)
+                        cv2.circle(frame_bgr, (cx, cy), 6, (0, 0, 0), 1)
+
+                # 2. Draw Dynamic Hand Tracking Box
+                cv2.rectangle(frame_bgr, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
+                cv2.putText(frame_bgr, f"3D SKELETON TRACKED ({len(hands)} hand{'s' if len(hands) > 1 else ''})",
+                            (xmin, max(25, ymin - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 0), 2)
+
+                # 3. Geometric Classification: the one-hand rules only apply to a single hand;
+                #    two visible hands mean a two-handed ISL letter, left to the CNN
+                if len(hands) == 1:
+                    geom_label, geom_conf = self.classify_geometric_landmarks(landmarks)
+                else:
+                    geom_label, geom_conf = None, 0.0
+
+                if self.numbers_mode:
+                    if len(hands) == 1:
+                        n = self.count_raised_fingers(landmarks)
+                        pred_label, pred_conf = f"Number '{n}'", 0.95
+                    else:
+                        pred_label, pred_conf = "Use ONE hand for numbers", 0.0
+                    return self._finish(frame_bgr, pred_label, pred_conf, [], hand_bbox, h)
+
+                # 4. Crop hand for CNN classification
+                cropped_hand = clean_bgr[ymin:ymax, xmin:xmax]
+                cnn_label = None
+                cnn_conf = 0.0
+
+                if cropped_hand.size > 0 and self.static_cnn.is_loaded:
+                    try:
+                        c_lbl, c_conf, c_top3 = self.static_cnn.predict(cropped_hand)
+                        cnn_label = c_lbl
+                        cnn_conf = c_conf
+                        top3_list = c_top3
+                    except (RuntimeError, ValueError, cv2.error) as e:
+                        logger.error(f"CNN prediction error: {e}")
+
+                # 5. Smart Fusion
+                if geom_label is not None and geom_conf >= 0.85:
+                    pred_label = geom_label
+                    pred_conf = geom_conf
+                    if not top3_list and cnn_label:
+                        top3_list = [(cnn_label, cnn_conf)]
+                elif cnn_label is not None and cnn_conf >= 0.35:
+                    pred_label = f"Sign '{cnn_label}'"
+                    pred_conf = cnn_conf
+                elif geom_label is not None:
+                    pred_label = geom_label
+                    pred_conf = geom_conf
+                else:
+                    pred_label = f"Sign '{cnn_label}'" if cnn_label else "Analyzing Hand..."
+                    pred_conf = cnn_conf
+
+        # -------------------------------------------------------------
+        # FALLBACK: If MediaPipe missed (hand too close / palm clipped)
+        # -------------------------------------------------------------
+        if not media_pipe_found:
+            fallback_box = self.detect_skin_hand_roi(frame_bgr)
+            if fallback_box is None and self.last_bbox is not None and self.last_bbox_age < 5:
+                # Use cached bbox
+                fallback_box = self.last_bbox
+                self.last_bbox_age += 1
+
+            if fallback_box is not None:
+                xmin, ymin, xmax, ymax = fallback_box
+                hand_bbox = fallback_box
+
+                cv2.rectangle(frame_bgr, (xmin, ymin), (xmax, ymax), (0, 220, 255), 2)
+                cv2.putText(frame_bgr, "HAND TRACKED (Move back for 3D skeleton)", (xmin, max(25, ymin - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 255), 1)
+
+                cropped_hand = clean_bgr[ymin:ymax, xmin:xmax]
+                if cropped_hand.size > 0 and self.static_cnn.is_loaded:
+                    try:
+                        c_lbl, c_conf, c_top3 = self.static_cnn.predict(cropped_hand)
+                        top3_list = c_top3
+                        # Report the CNN's own softmax confidence; the WhatsApp trigger applies its own threshold
+                        if c_lbl == 'W' and c_conf >= 0.30:
+                            pred_label = "Sign 'W' (WhatsApp)"
+                            pred_conf = c_conf
+                        elif c_conf >= 0.30:
+                            pred_label = f"Sign '{c_lbl}'"
+                            pred_conf = c_conf
+                        else:
+                            pred_label = "Analyzing Sign..."
+                            pred_conf = c_conf
+                    except (RuntimeError, ValueError, cv2.error) as e:
+                        logger.error(f"Fallback CNN error: {e}")
+            else:
+                pred_label = "Keep palm & fingers in view"
+                pred_conf = 0.0
+
+        return self._finish(frame_bgr, pred_label, pred_conf, top3_list, hand_bbox, h, media_pipe_found)
+
+    def _finish(self, frame_bgr, pred_label, pred_conf, top3_list, hand_bbox, h, media_pipe_found=True):
+        """Distance coaching + temporal smoothing shared by letter and number modes."""
+        # Distance coaching calculation
+        distance_hint = "SEARCHING"
+        if hand_bbox is not None:
+            _, y1, _, y2 = hand_bbox
+            box_h = y2 - y1
+            if box_h > 0.68 * h:
+                distance_hint = "TOO_CLOSE"
+            elif box_h < 0.18 * h:
+                distance_hint = "TOO_FAR"
+            else:
+                distance_hint = "OPTIMAL"
+
+        # Ultra-Fast Zero-Lag Smoothing
+        if pred_conf >= 0.75:
+            # Immediate response without latency!
+            self.history.append(pred_label)
+        elif media_pipe_found or hand_bbox is not None:
+            self.history.append(pred_label)
+            if len(self.history) >= 2:
+                pred_label = smooth_predictions(self.history)
+        else:
+            # When hand is absent, clear history so the next sign reacts instantly!
+            self.history.clear()
+
+        return frame_bgr, pred_label, pred_conf, top3_list, hand_bbox, distance_hint
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\inference\live_test.py =====
+
+"""
+Guided live sign test: the app shows a target sign (A-Z by default), the user signs it and
+presses SPACE, the recognizer's labels are collected for `capture_seconds`, and the
+majority label is compared with the target. Results are saved as CSV + JSON summary under
+evaluation_results/live_tests/ so the outcome can be shown as evidence.
+
+Run:  python src/main.py --mode letter_test
+"""
+
+import json
+import re
+import string
+import time
+from collections import Counter
+from datetime import datetime
+from typing import Dict, List, Optional
+
+import cv2
+import pandas as pd
+
+from src.utils.config import resolve_path
+from src.utils.logger import get_logger
+
+logger = get_logger("LiveSignTest")
+
+DEFAULT_TARGETS = list(string.ascii_uppercase)
+NUMBER_TARGETS = [str(i) for i in range(6)]
+_KEY = re.compile(r"(?:Sign|Number) '([^']+)'")
+
+
+def target_key(label: str) -> str:
+    """Sign 'A' (Fist) -> "A", Number '3' -> "3"; other labels unchanged."""
+    m = _KEY.search(label or "")
+    return m.group(1).strip().upper() if m else (label or "")
+
+
+class SignTestSession:
+    """UI-independent bookkeeping for a guided live test (unit-testable)."""
+
+    def __init__(self, targets: Optional[List[str]] = None, capture_seconds: float = 2.0):
+        self.targets = [t.upper() for t in (targets or DEFAULT_TARGETS)]
+        self.capture_seconds = capture_seconds
+        self.index = 0
+        self.results: List[Dict[str, object]] = []
+        self._capturing_since: Optional[float] = None
+        self._labels: List[str] = []
+
+    @property
+    def done(self) -> bool:
+        return self.index >= len(self.targets)
+
+    @property
+    def current(self) -> Optional[str]:
+        return None if self.done else self.targets[self.index]
+
+    @property
+    def capturing(self) -> bool:
+        return self._capturing_since is not None
+
+    def start_capture(self, now: float):
+        if not self.done:
+            self._capturing_since, self._labels = now, []
+
+    def feed(self, label: str, now: float) -> Optional[Dict[str, object]]:
+        """Add one frame's label while capturing; returns the result once the window closes."""
+        if not self.capturing:
+            return None
+        self._labels.append(target_key(label))
+        if now - self._capturing_since < self.capture_seconds:
+            return None
+        return self._finish("captured")
+
+    def skip(self) -> Optional[Dict[str, object]]:
+        if self.done:
+            return None
+        self._labels = []
+        return self._finish("skipped")
+
+    def _finish(self, status: str) -> Dict[str, object]:
+        counts = Counter(self._labels)
+        majority, votes = counts.most_common(1)[0] if counts else ("", 0)
+        target = self.targets[self.index]
+        result = {
+            "target": target, "status": status, "recognised": majority,
+            "correct": status == "captured" and str(majority).upper() == target,
+            "agreement": round(votes / len(self._labels), 3) if self._labels else 0.0,
+            "frames": len(self._labels),
+        }
+        self.results.append(result)
+        self.index += 1
+        self._capturing_since, self._labels = None, []
+        return result
+
+    def summary(self) -> Dict[str, object]:
+        tested = [r for r in self.results if r["status"] == "captured"]
+        correct = [r for r in tested if r["correct"]]
+        return {
+            "targets": len(self.targets), "tested": len(tested), "skipped": len(self.results) - len(tested),
+            "correct": len(correct), "accuracy_on_tested": round(len(correct) / len(tested), 4) if tested else None,
+            "failed": [f"{r['target']}->{r['recognised']}" for r in tested if not r["correct"]],
+        }
+
+    def save(self, out_dir: str = "evaluation_results/live_tests", prefix: str = "letter_test") -> str:
+        out = resolve_path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = out / f"{prefix}_{stamp}.csv"
+        pd.DataFrame(self.results).to_csv(csv_path, index=False)
+        with open(out / f"{prefix}_{stamp}_summary.json", "w", encoding="utf-8") as f:
+            json.dump(self.summary(), f, indent=2)
+        return str(csv_path)
+
+
+def run_letter_test(config_path: str = "config.yaml", targets: Optional[List[str]] = None, numbers: bool = False):
+    """Interactive webcam test (A-Z, or 0-5 with numbers=True). Keys: SPACE = capture, S = skip, Q = finish."""
+    from src.camera.camera import CameraManager
+    from src.inference.gesture_translator import ISLGestureTranslator
+    from src.utils.config import load_config
+
+    cam_cfg = load_config(config_path).get("camera", {})
+    cam = CameraManager(camera_index=cam_cfg.get("index", 0), width=cam_cfg.get("width", 640),
+                        height=cam_cfg.get("height", 480), target_fps=cam_cfg.get("fps", 30))
+    if not cam.start():
+        logger.error("Failed to start camera hardware.")
+        return None
+    translator = ISLGestureTranslator()
+    translator.numbers_mode = numbers
+    session = SignTestSession(targets or (NUMBER_TARGETS if numbers else DEFAULT_TARGETS))
+    last = None
+    try:
+        while not session.done:
+            ok, raw = cam.read_frame()
+            if not ok or raw is None:
+                logger.error("Empty frame received from camera feed.")
+                break
+            frame = cv2.flip(raw, 1)
+            out, label, conf, _, _, _ = translator.process_frame(frame)
+            now = time.time()
+            res = session.feed(label, now)
+            if res is not None:
+                last = res
+                logger.info(f"{res['target']}: recognised {res['recognised']!r} -> {'PASS' if res['correct'] else 'FAIL'}")
+
+            h, w, _ = out.shape
+            cv2.rectangle(out, (0, 0), (w, 110), (20, 20, 25), -1)
+            cv2.putText(out, f"Sign this: {session.current}", (15, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
+            cv2.putText(out, f"Seen now: {label} ({conf * 100:.0f}%)", (15, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1)
+            state = "CAPTURING..." if session.capturing else "SPACE = capture | S = skip | Q = finish"
+            cv2.putText(out, f"{session.index + 1}/{len(session.targets)}  {state}", (15, 102),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 120) if session.capturing else (180, 180, 180), 1)
+            if last is not None:
+                verdict = "PASS" if last["correct"] else ("SKIPPED" if last["status"] == "skipped" else "FAIL")
+                cv2.putText(out, f"Last: {last['target']} -> {last['recognised'] or '-'}  {verdict}", (15, h - 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0) if last["correct"] else (0, 0, 255), 2)
+            cv2.imshow("ISL Number Test" if numbers else "ISL Letter Test", out)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord(" ") and not session.capturing:
+                session.start_capture(now)
+            elif key == ord("s") and not session.capturing:
+                last = session.skip()
+            elif key == ord("q"):
+                break
+    finally:
+        cam.release()
+        translator.close()
+    path = session.save(prefix="number_test" if numbers else "letter_test")
+    summary = session.summary()
+    print(f"\n========== {'NUMBER' if numbers else 'LETTER'} TEST SUMMARY ==========")
+    print(json.dumps(summary, indent=2))
+    print(f"Per-letter results: {path}")
+    return summary
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\inference\oneshot_dynamic.py =====
+
+"""
+One-shot dynamic sign recognition by reference matching.
+
+Only one reference clip per sign is available (Sample Videos/, 61 clips), which is too
+little to train the CNN + Bi-GRU model honestly. Instead, each clip is encoded with a frozen
+ImageNet MobileNetV2 (no training) into a sequence of per-frame embeddings, and a query
+clip is labelled with the reference sequence it matches best under dynamic time warping
+(DTW) on cosine distance.
+
+The returned score is a DTW similarity in [-1, 1], NOT a probability.
+"""
+
+import hashlib
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple, Union
+
+import cv2
+import numpy as np
+
+from src.preprocessing.video_preprocessing import extract_frames_from_video, sample_or_pad_sequence
+from src.utils.config import resolve_path
+from src.utils.logger import get_logger
+
+logger = get_logger("OneShotDynamic")
+
+DEFAULT_GALLERY = "models/dynamic_oneshot/gallery.npz"
+EMBED_SIZE = (224, 224)
+BACKBONE_NAME = "MobileNetV2-ImageNet-avgpool"
+
+
+class FrameEncoder:
+    """Frozen MobileNetV2 (ImageNet weights) mapping RGB frames to L2-normalised 1280-d vectors."""
+
+    def __init__(self):
+        import tensorflow as tf
+        self._tf = tf
+        self.model = tf.keras.applications.MobileNetV2(
+            input_shape=EMBED_SIZE + (3,), include_top=False, weights="imagenet", pooling="avg"
+        )
+        self.model.trainable = False
+
+    def encode(self, frames_rgb: Sequence[np.ndarray]) -> np.ndarray:
+        """frames_rgb: list of (H, W, 3) uint8 RGB frames -> (N, 1280) float32, unit length."""
+        if len(frames_rgb) == 0:
+            raise ValueError("No frames to encode")
+        batch = np.stack([
+            cv2.resize(f, (EMBED_SIZE[1], EMBED_SIZE[0]), interpolation=cv2.INTER_LINEAR) for f in frames_rgb
+        ]).astype(np.float32)
+        batch = self._tf.keras.applications.mobilenet_v2.preprocess_input(batch)
+        feats = np.asarray(self.model(batch, training=False), dtype=np.float32)
+        return feats / (np.linalg.norm(feats, axis=1, keepdims=True) + 1e-8)
+
+
+def dtw_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """
+    DTW over cosine distance between two unit-normalised embedding sequences (Ta, D), (Tb, D).
+    Returns 1 - (accumulated cost / warping-path length), i.e. a cosine-like similarity.
+    """
+    cost = 1.0 - a @ b.T
+    ta, tb = cost.shape
+    acc = np.full((ta + 1, tb + 1), np.inf)
+    steps = np.zeros((ta + 1, tb + 1))
+    acc[0, 0] = 0.0
+    for i in range(1, ta + 1):
+        for j in range(1, tb + 1):
+            prev = min((acc[i - 1, j - 1], steps[i - 1, j - 1]),
+                       (acc[i - 1, j], steps[i - 1, j]),
+                       (acc[i, j - 1], steps[i, j - 1]))
+            acc[i, j] = cost[i - 1, j - 1] + prev[0]
+            steps[i, j] = prev[1] + 1
+    return float(1.0 - acc[ta, tb] / steps[ta, tb])
+
+
+def aligned_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """Mean cosine similarity of frame-aligned sequences of equal length (ablation baseline)."""
+    return float(np.mean(np.sum(a * b, axis=1)))
+
+
+def file_md5(path: Union[str, Path]) -> str:
+    with open(path, "rb") as f:
+        return hashlib.md5(f.read()).hexdigest()
+
+
+def embed_sequence(encoder: FrameEncoder, frames_rgb: List[np.ndarray], sequence_length: int) -> np.ndarray:
+    """Uniformly sample sequence_length frames (order preserved) and encode them -> (T, 1280)."""
+    return encoder.encode(sample_or_pad_sequence(frames_rgb, target_len=sequence_length))
+
+
+class OneShotDynamicRecognizer:
+    """Labels a video / frame sequence with the best-matching reference clip from the gallery."""
+
+    def __init__(self, gallery_path: str = DEFAULT_GALLERY, strict: bool = False,
+                 encoder: Optional[FrameEncoder] = None):
+        self.gallery_path = str(resolve_path(gallery_path))
+        self.is_loaded = False
+        self.load_error: Optional[str] = None
+        self.labels: List[str] = []
+        self.embeddings: Optional[np.ndarray] = None
+        self.sequence_length = 0
+        self._encoder = encoder
+        try:
+            self._load()
+        except (FileNotFoundError, ValueError, KeyError, OSError) as e:
+            self.load_error = str(e)
+            if strict:
+                raise
+            logger.warning(f"One-shot dynamic gallery unavailable: {e}")
+
+    def _load(self):
+        if not Path(self.gallery_path).exists():
+            raise FileNotFoundError(f"One-shot gallery not found: {self.gallery_path} "
+                                    f"(build it with: python src/training/build_oneshot_gallery.py)")
+        data = np.load(self.gallery_path, allow_pickle=False)
+        self.embeddings = data["embeddings"].astype(np.float32)
+        self.labels = [str(x) for x in data["labels"]]
+        self.sequence_length = int(data["sequence_length"])
+        backbone = str(data["backbone"])
+        if backbone != BACKBONE_NAME:
+            raise ValueError(f"Gallery built with backbone '{backbone}', expected '{BACKBONE_NAME}'")
+        if self.embeddings.ndim != 3 or self.embeddings.shape[0] != len(self.labels) \
+                or self.embeddings.shape[1] != self.sequence_length:
+            raise ValueError(f"Gallery embeddings shape {self.embeddings.shape} inconsistent with "
+                             f"{len(self.labels)} labels and T={self.sequence_length}")
+        if len(set(self.labels)) != len(self.labels):
+            raise ValueError("Gallery contains duplicate labels")
+        if self._encoder is None:
+            self._encoder = FrameEncoder()
+        self.is_loaded = True
+        logger.info(f"One-shot gallery loaded: {len(self.labels)} signs, T={self.sequence_length}, {backbone}")
+
+    def embed(self, video_or_frames: Union[str, List[np.ndarray]]) -> np.ndarray:
+        frames = extract_frames_from_video(video_or_frames) if isinstance(video_or_frames, str) else video_or_frames
+        return embed_sequence(self._encoder, frames, self.sequence_length)
+
+    def rank(self, query_embedding: np.ndarray) -> List[Tuple[str, float]]:
+        """All gallery labels sorted by DTW similarity to the query embedding sequence."""
+        sims = [dtw_similarity(query_embedding, ref) for ref in self.embeddings]
+        order = np.argsort(sims)[::-1]
+        return [(self.labels[i], float(sims[i])) for i in order]
+
+    def predict(self, video_or_frames: Union[str, List[np.ndarray]]) -> Tuple[str, float, List[Tuple[str, float]]]:
+        """Video path or list of RGB frames -> (label, DTW similarity, top-3)."""
+        if not self.is_loaded:
+            return "Waiting for reference gallery...", 0.0, []
+        ranking = self.rank(self.embed(video_or_frames))
+        return ranking[0][0], ranking[0][1], ranking[:3]
+
+
+def build_gallery(clip_paths: Dict[str, Path], sequence_length: int, out_path: Union[str, Path],
+                  encoder: Optional[FrameEncoder] = None) -> Path:
+    """Encode one reference clip per label and save the gallery (.npz, no pickled objects)."""
+    encoder = encoder or FrameEncoder()
+    labels, embs, sources, hashes = [], [], [], []
+    for label in sorted(clip_paths):
+        path = Path(clip_paths[label])
+        embs.append(embed_sequence(encoder, extract_frames_from_video(str(path)), sequence_length))
+        labels.append(label)
+        sources.append(path.name)
+        hashes.append(file_md5(path))
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(out_path, embeddings=np.stack(embs).astype(np.float32), labels=np.array(labels),
+             sources=np.array(sources), source_md5=np.array(hashes),
+             sequence_length=np.int64(sequence_length), backbone=np.array(BACKBONE_NAME))
+    logger.info(f"Saved one-shot gallery ({len(labels)} signs, T={sequence_length}) to {out_path}")
+    return out_path
+
+
+class LiveDynamicMatcher:
+    """
+    Rolling webcam window for a sequence recognizer exposing is_loaded / load_error /
+    predict(frames) -> (label, score, top3) (OneShotDynamicRecognizer or DynamicInferenceEngine). Frames (RGB, un-mirrored) are buffered
+    for window_seconds; every match_every_seconds, if a hand was visible in at least
+    min_hand_fraction of the buffered frames, the window is matched in a background thread
+    so the UI loop is not blocked. latest_result holds (label, similarity, top3, timestamp).
+    """
+
+    def __init__(self, recognizer, window_seconds: float = 4.0,
+                 match_every_seconds: float = 1.0, min_hand_fraction: float = 0.6):
+        from collections import deque
+        from concurrent.futures import ThreadPoolExecutor
+        if not recognizer.is_loaded:
+            raise ValueError(f"Recognizer not loaded: {recognizer.load_error}")
+        self.recognizer = recognizer
+        self.window_seconds = window_seconds
+        self.match_every_seconds = match_every_seconds
+        self.min_hand_fraction = min_hand_fraction
+        self._buffer = deque()  # (timestamp, rgb_frame, hand_present)
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._pending = None
+        self._last_submit = 0.0
+        self.latest_result: Optional[Tuple[str, float, List[Tuple[str, float]], float]] = None
+
+    def push(self, frame_rgb: np.ndarray, timestamp: float, hand_present: bool):
+        small = cv2.resize(frame_rgb, (EMBED_SIZE[1], EMBED_SIZE[0]), interpolation=cv2.INTER_LINEAR)
+        self._buffer.append((timestamp, small, bool(hand_present)))
+        while self._buffer and timestamp - self._buffer[0][0] > self.window_seconds:
+            self._buffer.popleft()
+
+    def hand_fraction(self) -> float:
+        return sum(h for _, _, h in self._buffer) / len(self._buffer) if self._buffer else 0.0
+
+    def poll(self, now: float) -> bool:
+        """Collect a finished match and start a new one if due. Returns True when a new result arrived."""
+        new_result = False
+        if self._pending is not None and self._pending.done():
+            label, sim, top3 = self._pending.result()
+            self.latest_result = (label, sim, top3, now)
+            self._pending = None
+            new_result = True
+        span = self._buffer[-1][0] - self._buffer[0][0] if len(self._buffer) > 1 else 0.0
+        if (self._pending is None and now - self._last_submit >= self.match_every_seconds
+                and span >= 0.5 * self.window_seconds and self.hand_fraction() >= self.min_hand_fraction):
+            frames = [f for _, f, _ in self._buffer]
+            self._pending = self._executor.submit(self.recognizer.predict, frames)
+            self._last_submit = now
+        return new_result
+
+    def clear(self):
+        self._buffer.clear()
+        self.latest_result = None
+
+    def close(self):
+        self._executor.shutdown(wait=True, cancel_futures=True)
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\inference\realtime_inference.py =====
+
+import cv2
+import time
+from src.camera.camera import CameraManager
+from src.inference.actions import build_trigger_from_config
+from src.inference.gesture_translator import ISLGestureTranslator, smooth_predictions  # noqa: F401 (re-exported)
+from src.inference.dynamic_inference import DynamicInferenceEngine
+from src.inference.oneshot_dynamic import LiveDynamicMatcher, OneShotDynamicRecognizer
+from src.utils.config import load_config
+from src.utils.logger import get_logger
+
+logger = get_logger("RealTimePipeline")
+
+def run_realtime_application(mode: str = "STATIC", config_path: str = "config.yaml"):
+    """
+    Unified Real-Time ISL Recognition & Action Trigger System.
+    - Tracks hand landmarks using MediaPipe.
+    - Classifies ISL signs (A-Z, Thumbs Up/Down, Peace/V, W, etc.).
+    - Triggers Assistive Desktop Actions (config.yaml "actions"; defaults):
+        * Hold Sign 'W' -> WhatsApp, 'Y' -> YouTube, 'L' -> Google
+    STATIC mode classifies each frame (MediaPipe geometry + static CNN).
+    DYNAMIC mode classifies the last few seconds of video with the recognizer selected by
+    config dynamic.live_method: "oneshot" (60 signs, one reference clip each, frozen
+    MobileNetV2 + DTW similarity) or "trained" (MobileNetV2 + Bi-GRU trained on the classes
+    listed in models/dynamic/class_mapping.json, softmax probability). It falls back to
+    stringing per-frame static labels together only if neither is available.
+    """
+    cfg = load_config(config_path)
+    cam_cfg = cfg.get("camera", {})
+    inf_cfg = cfg.get("inference", {})
+    dyn_cfg = cfg.get("dynamic", {})
+
+    conf_threshold = inf_cfg.get("confidence_threshold", 0.40)
+    mirror_mode = True
+
+    # Initialize Camera Hardware
+    cam = CameraManager(
+        camera_index=cam_cfg.get("index", 0),
+        width=cam_cfg.get("width", 640),
+        height=cam_cfg.get("height", 480),
+        target_fps=cam_cfg.get("fps", 30)
+    )
+
+    if not cam.start():
+        logger.error("Failed to start camera hardware. Exiting real-time application.")
+        return
+
+    # Initialize Gesture & ISL Translator Engine
+    translator = ISLGestureTranslator()
+
+    frame_counter = 0
+    prev_time = time.time()
+    fps = 0.0
+
+    # Phrase history for dynamic sentence formation
+    phrase_tokens = []
+    last_added_token = ""
+    last_added_time = 0
+
+    # Sign-triggered app launches (W -> WhatsApp, Y -> YouTube, L -> Google by default)
+    action_trigger = build_trigger_from_config(cfg)
+    action_message = ""
+    action_message_time = 0
+    shortcut_text = "  |  ".join(f"'{a.key}' -> {a.name}" for a in action_trigger.actions.values())         if action_trigger else "disabled"
+
+    # One-shot dynamic matcher (DYNAMIC mode only)
+    dyn_matcher = None
+    dyn_score_name = ""
+    if mode.upper() == "DYNAMIC":
+        live_method = str(dyn_cfg.get("live_method", "trained")).lower()
+        if live_method == "trained":
+            recognizer = DynamicInferenceEngine()
+            dyn_score_name = "prob"
+        else:
+            recognizer = OneShotDynamicRecognizer(dyn_cfg.get("oneshot_gallery", "models/dynamic_oneshot/gallery.npz"))
+            dyn_score_name = "DTW sim, one-shot"
+        logger.info(f"DYNAMIC recognizer: {live_method}")
+        if recognizer.is_loaded:
+            dyn_matcher = LiveDynamicMatcher(
+                recognizer,
+                window_seconds=float(dyn_cfg.get("live_window_seconds", 4.0)),
+                match_every_seconds=float(dyn_cfg.get("live_match_every_seconds", 1.0)),
+            )
+        else:
+            logger.warning(f"Dynamic recognizer unavailable ({recognizer.load_error}); DYNAMIC mode falls back to "
+                           f"per-frame static predictions, which is not temporal recognition.")
+    last_dyn_token_time = 0.0
+
+    logger.info(f"Starting Unified ISL Translator | Mode: {mode.upper()} | Mirror: {mirror_mode}")
+    if not translator.static_cnn.is_loaded:
+        logger.warning(f"Static CNN not loaded ({translator.static_cnn.load_error}); only MediaPipe geometric rules will run.")
+
+    try:
+        while True:
+            ret, raw_frame = cam.read_frame()
+            if not ret or raw_frame is None:
+                logger.error("Empty frame received from camera feed.")
+                break
+
+            # Mirror mode (flip horizontally so movements match user perspective)
+            if mirror_mode:
+                frame = cv2.flip(raw_frame, 1)
+            else:
+                frame = raw_frame.copy()
+
+            frame_counter += 1
+            curr_time = time.time()
+            fps = 0.9 * fps + 0.1 * (1.0 / (curr_time - prev_time + 1e-6))
+            prev_time = curr_time
+
+            # Run MediaPipe hand tracking & sign translation
+            out_frame, current_label, current_confidence, top3_candidates, hand_bbox, distance_hint = translator.process_frame(frame)
+
+            h, w, _ = out_frame.shape
+
+            # -------------------------------------------------------------
+            # ASSISTIVE ACTION TRIGGER: HOLD A MAPPED SIGN -> OPEN APP
+            # -------------------------------------------------------------
+            held_action, hold_progress, fired_action = (None, 0.0, None)
+            if action_trigger is not None:
+                held_action, hold_progress, fired_action = action_trigger.update(current_label, current_confidence, curr_time)
+            if fired_action is not None:
+                action_message = f"ACTION EXECUTED: OPENING {fired_action.name.upper()}!"
+                action_message_time = curr_time
+
+            # Dynamic mode: one-shot temporal matching on the un-mirrored frames
+            if dyn_matcher is not None:
+                dyn_matcher.push(cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB), curr_time, hand_bbox is not None)
+                if dyn_matcher.poll(curr_time):
+                    dyn_label = dyn_matcher.latest_result[0]
+                    if dyn_label != last_added_token or (curr_time - last_dyn_token_time) > 3.0:
+                        phrase_tokens.append(dyn_label)
+                        last_added_token = dyn_label
+                        last_dyn_token_time = curr_time
+                        if len(phrase_tokens) > 6:
+                            phrase_tokens.pop(0)
+                if dyn_matcher.latest_result is not None and curr_time - dyn_matcher.latest_result[3] < 3.0:
+                    d_label, d_sim, _, _ = dyn_matcher.latest_result
+                    cv2.putText(out_frame, f"Dynamic match: {d_label}  ({dyn_score_name} {d_sim:.2f})",
+                                (15, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 215, 0), 2)
+            # Fallback token accumulation (no gallery): per-frame static labels
+            elif mode.upper() == "DYNAMIC":
+                if current_confidence >= 0.70 and current_label not in ("Show Hand to Camera", "Analyzing Hand..."):
+                    if current_label != last_added_token and (curr_time - last_added_time) > 1.2:
+                        token_short = current_label.replace("Sign '", "").replace("'", "").split(" ")[0]
+                        phrase_tokens.append(token_short)
+                        last_added_token = current_label
+                        last_added_time = curr_time
+                        if len(phrase_tokens) > 6:
+                            phrase_tokens.pop(0)
+
+            # Determine status color
+            if current_confidence >= 0.70:
+                conf_color = (0, 255, 0)      # Bright Green
+            elif current_confidence >= conf_threshold:
+                conf_color = (0, 230, 255)    # Amber/Yellow
+            else:
+                conf_color = (120, 180, 255)  # Light Blue / Gray
+
+            # -------------------------------------------------------------
+            # Top Dashboard Header Bar (Height = 115 px)
+            # -------------------------------------------------------------
+            overlay = out_frame.copy()
+            cv2.rectangle(overlay, (0, 0), (w, 115), (20, 20, 25), -1)
+            cv2.addWeighted(overlay, 0.85, out_frame, 0.15, 0, out_frame)
+
+            # Line 1: System Info & Distance Coaching
+            if distance_hint == "TOO_CLOSE":
+                dist_str = "TOO CLOSE (Move hand back slightly)"
+                dist_color = (0, 140, 255)
+            elif distance_hint == "TOO_FAR":
+                dist_str = "TOO FAR (Move hand closer 1-2 ft)"
+                dist_color = (0, 200, 255)
+            elif distance_hint == "OPTIMAL":
+                dist_str = "OPTIMAL (3D Skeleton Tracked)"
+                dist_color = (0, 255, 100)
+            else:
+                dist_str = "SEARCHING (Keep hand 1-2 ft away)"
+                dist_color = (180, 180, 180)
+
+            cv2.putText(out_frame, f"Mode: {mode.upper()}  |  FPS: {fps:.1f}  |  Position: {dist_str}", 
+                        (15, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.48, dist_color, 1)
+
+            # Line 2: Prominent Recognized Sign Banner
+            cv2.putText(out_frame, "Recognized Sign :", (15, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 2)
+            cv2.putText(out_frame, f"[ {current_label} ]", (210, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.95, (0, 255, 255), 2)
+
+            # Line 2 (Right): Confidence Percentage
+            conf_percent = current_confidence * 100.0
+            cv2.putText(out_frame, f"{conf_percent:.1f}%", (w - 110, 62),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, conf_color, 2)
+
+            # Draw Confidence Bar Underneath
+            bar_x = w - 180
+            bar_y = 72
+            bar_w = 160
+            bar_h = 7
+            cv2.rectangle(out_frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (50, 50, 50), -1)
+            fill_w = int(bar_w * min(1.0, current_confidence))
+            cv2.rectangle(out_frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), conf_color, -1)
+
+            # Line 3: Dynamic Sentence or Top 3 Candidates
+            if mode.upper() == "DYNAMIC" and phrase_tokens:
+                sentence_str = "Sign Sequence:  " + "  ->  ".join(phrase_tokens)
+                cv2.putText(out_frame, sentence_str, (15, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 215, 0), 2)
+            elif top3_candidates:
+                top3_str = "CNN Top Candidates:  " + "   |   ".join(
+                    [f"#{i+1}: [{c[0]}] ({c[1]*100:.0f}%)" for i, c in enumerate(top3_candidates[:3])]
+                )
+                cv2.putText(out_frame, top3_str, (15, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (180, 220, 255), 1)
+            else:
+                cv2.putText(out_frame, f"Hold to open: {shortcut_text}", 
+                            (15, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (170, 170, 170), 1)
+
+            # -------------------------------------------------------------
+            # ACTION TRIGGER OVERLAYS (WHATSAPP HOLD PROGRESS & TRIGGER BANNER)
+            # -------------------------------------------------------------
+            if held_action is not None and hold_progress > 0.0:
+                # Draw animated progress bar in center of screen
+                prog_w = 340
+                prog_h = 42
+                px = int((w - prog_w) / 2)
+                py = 135
+
+                cv2.rectangle(out_frame, (px - 5, py - 5), (px + prog_w + 5, py + prog_h + 5), (20, 20, 20), -1)
+                cv2.rectangle(out_frame, (px - 5, py - 5), (px + prog_w + 5, py + prog_h + 5), (0, 255, 100), 2)
+
+                # Progress fill
+                fill_p = int(prog_w * hold_progress)
+                cv2.rectangle(out_frame, (px, py + 22), (px + fill_p, py + prog_h - 4), (0, 255, 0), -1)
+
+                pct = int(hold_progress * 100)
+                cv2.putText(out_frame, f"OPENING {held_action.name.upper()}... HOLD SIGN ({pct}%)", (px + 12, py + 16),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 255), 2)
+
+            # If action was recently triggered, flash success banner for 3.5 seconds
+            if (curr_time - action_message_time) < 3.5:
+                banner_w = 440
+                banner_h = 48
+                bx = int((w - banner_w) / 2)
+                by = 130
+                cv2.rectangle(out_frame, (bx - 5, by - 5), (bx + banner_w + 5, by + banner_h + 5), (0, 180, 0), -1)
+                cv2.rectangle(out_frame, (bx - 5, by - 5), (bx + banner_w + 5, by + banner_h + 5), (255, 255, 255), 2)
+                cv2.putText(out_frame, action_message, (bx + 15, by + 32),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+
+            # -------------------------------------------------------------
+            # Bottom-Right Picture-in-Picture (PiP) Inset (Cropped Hand)
+            # -------------------------------------------------------------
+            if hand_bbox is not None:
+                xmin, ymin, xmax, ymax = hand_bbox
+                cropped_hand = frame[ymin:ymax, xmin:xmax]
+                if cropped_hand is not None and cropped_hand.size > 0:
+                    pip_size = 110
+                    pip_img = cv2.resize(cropped_hand, (pip_size, pip_size))
+                    px1 = w - pip_size - 15
+                    py1 = h - pip_size - 38
+                    px2 = px1 + pip_size
+                    py2 = py1 + pip_size
+
+                    cv2.rectangle(out_frame, (px1 - 2, py1 - 16), (px2 + 2, py2 + 2), (30, 30, 30), -1)
+                    cv2.rectangle(out_frame, (px1 - 2, py1 - 16), (px2 + 2, py2 + 2), (0, 255, 0), 1)
+                    cv2.putText(out_frame, "Hand Crop (AI)", (px1, py1 - 4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1)
+                    out_frame[py1:py2, px1:px2] = pip_img
+
+            # -------------------------------------------------------------
+            # Footer Instructions Bar (Height = 28 px)
+            # -------------------------------------------------------------
+            cv2.rectangle(out_frame, (0, h - 28), (w, h), (15, 15, 15), -1)
+            cv2.putText(out_frame, f"Hold sign: {shortcut_text}  |  [N] Numbers {'ON' if translator.numbers_mode else 'OFF'}  [Q] Exit  [M] Mirror  [C] Clear", 
+                        (15, h - 9), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (200, 200, 200), 1)
+
+            cv2.imshow("ISL Real-Time Recognition System", out_frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                logger.info("User requested exit ('q' key pressed).")
+                break
+            elif key == ord('n'):
+                translator.numbers_mode = not translator.numbers_mode
+                logger.info(f"Numbers mode (finger count 0-5): {translator.numbers_mode}")
+            elif key == ord('m'):
+                mirror_mode = not mirror_mode
+                logger.info(f"Mirror mode toggled: {mirror_mode}")
+            elif key == ord('c'):
+                phrase_tokens.clear()
+                if dyn_matcher is not None:
+                    dyn_matcher.clear()
+                translator.history.clear()
+
+    finally:
+        cam.release()
+        translator.close()
+        if dyn_matcher is not None:
+            dyn_matcher.close()
+        logger.info("Real-time application terminated safely.")
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\inference\static_inference.py =====
+
+import cv2
+import numpy as np
+from pathlib import Path
+from typing import Tuple, Optional, List
+from src.utils.class_mapping import ClassMappingManager
+from src.utils.config import resolve_path
+from src.utils.logger import get_logger
+
+logger = get_logger("StaticInferenceEngine")
+
+# The only trained static artifact in the repository. It was exported from the
+# train_cnn.py custom CNN (3x Conv2D + Dense 128 + Dense 26 softmax). Its
+# Rescaling(1/255) layer is folded into the first convolution, so it expects
+# float32 RGB pixels in [0, 255] with shape (1, 224, 224, 3).
+DEFAULT_STATIC_MODEL = "model/custom_cnn.tflite"
+DEFAULT_STATIC_MAPPING = "models/static/class_mapping.json"
+
+
+def _make_tflite_interpreter(model_path: str):
+    """Create a TFLite interpreter, preferring LiteRT and falling back to tf.lite."""
+    try:
+        from ai_edge_litert.interpreter import Interpreter
+    except ImportError:
+        import tensorflow as tf
+        Interpreter = tf.lite.Interpreter
+    return Interpreter(model_path=model_path)
+
+
+def prepare_static_input(frame_bgr: np.ndarray, target_size: Tuple[int, int] = (224, 224)) -> np.ndarray:
+    """
+    Convert an OpenCV BGR/BGRA/grayscale frame to the static model input:
+    RGB, resized (bilinear, as tf.keras.utils.image_dataset_from_directory does during
+    training) to target_size=(height, width), float32 in [0, 255], with a batch axis.
+    """
+    if not isinstance(frame_bgr, np.ndarray):
+        raise TypeError(f"Frame must be a numpy.ndarray, got {type(frame_bgr)}")
+    if frame_bgr.ndim == 2:
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_GRAY2RGB)
+    elif frame_bgr.ndim == 3 and frame_bgr.shape[2] == 3:
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    elif frame_bgr.ndim == 3 and frame_bgr.shape[2] == 4:
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGRA2RGB)
+    else:
+        raise ValueError(f"Unsupported frame shape {frame_bgr.shape}; expected (H, W), (H, W, 3) or (H, W, 4)")
+    resized = cv2.resize(rgb, (target_size[1], target_size[0]), interpolation=cv2.INTER_LINEAR)
+    return np.expand_dims(resized.astype(np.float32), axis=0)
+
+
+class StaticInferenceEngine:
+    """Inference engine for static single-frame ISL recognition (.tflite or .keras artifact)."""
+
+    def __init__(self, model_path: str = DEFAULT_STATIC_MODEL, mapping_path: str = DEFAULT_STATIC_MAPPING,
+                 strict: bool = False):
+        """
+        strict=False keeps the real-time UI usable without a model (is_loaded=False and
+        load_error set). strict=True raises on a missing/corrupt/mismatched artifact.
+        """
+        self.model_path = str(resolve_path(model_path))
+        self.mapping_path = str(resolve_path(mapping_path))
+        self.mapping: Optional[ClassMappingManager] = None
+        self.is_loaded = False
+        self.load_error: Optional[str] = None
+        self.input_size: Tuple[int, int] = (224, 224)
+        self.num_classes = 0
+        self._keras_model = None
+        self._interpreter = None
+        self._input_index = None
+        self._output_index = None
+        try:
+            self._load()
+        except (FileNotFoundError, ValueError, RuntimeError, OSError) as e:
+            self.load_error = str(e)
+            self.is_loaded = False
+            if strict:
+                raise
+            logger.warning(f"Static CNN unavailable: {e}")
+
+    def _load(self):
+        if not Path(self.model_path).exists():
+            raise FileNotFoundError(f"Static model file not found: {self.model_path}")
+        self.mapping = ClassMappingManager.load_json(self.mapping_path)
+
+        suffix = Path(self.model_path).suffix.lower()
+        if suffix == ".tflite":
+            self._interpreter = _make_tflite_interpreter(self.model_path)
+            self._interpreter.allocate_tensors()
+            in_det = self._interpreter.get_input_details()[0]
+            out_det = self._interpreter.get_output_details()[0]
+            in_shape, out_shape = tuple(in_det["shape"]), tuple(out_det["shape"])
+            if in_det["dtype"] != np.float32:
+                raise ValueError(f"Unsupported TFLite input dtype {in_det['dtype']} (expected float32)")
+            self._input_index, self._output_index = in_det["index"], out_det["index"]
+        elif suffix in (".keras", ".h5"):
+            import tensorflow as tf
+            self._keras_model = tf.keras.models.load_model(self.model_path)
+            in_shape = tuple(self._keras_model.input_shape)
+            out_shape = tuple(self._keras_model.output_shape)
+        else:
+            raise ValueError(f"Unsupported static model format '{suffix}' ({self.model_path})")
+
+        if len(in_shape) != 4 or in_shape[3] != 3:
+            raise ValueError(f"Static model input shape {in_shape} is not (batch, H, W, 3)")
+        self.input_size = (int(in_shape[1]), int(in_shape[2]))
+        self.num_classes = int(out_shape[-1])
+        if self.num_classes != self.mapping.num_classes():
+            raise ValueError(
+                f"Static model outputs {self.num_classes} classes but {self.mapping_path} "
+                f"maps {self.mapping.num_classes()} labels"
+            )
+        self.is_loaded = True
+        logger.info(f"Static model loaded from {self.model_path} | input {in_shape} -> {self.num_classes} classes")
+
+    def predict_probabilities(self, frame: np.ndarray) -> np.ndarray:
+        """Return the softmax probability vector (num_classes,) for one BGR frame."""
+        if not self.is_loaded:
+            raise RuntimeError(f"Static model is not loaded: {self.load_error}")
+        batch = prepare_static_input(frame, self.input_size)
+        if self._interpreter is not None:
+            self._interpreter.set_tensor(self._input_index, batch)
+            self._interpreter.invoke()
+            probs = self._interpreter.get_tensor(self._output_index)[0]
+        else:
+            probs = np.asarray(self._keras_model(batch, training=False))[0]
+        probs = np.asarray(probs, dtype=np.float32)
+        if probs.shape != (self.num_classes,) or not np.all(np.isfinite(probs)):
+            raise RuntimeError(f"Invalid static model output (shape {probs.shape})")
+        return probs
+
+    def predict(self, frame: np.ndarray) -> Tuple[str, float, List[Tuple[str, float]]]:
+        """
+        Run static prediction pipeline on a BGR frame (e.g. a hand crop).
+        Returns Tuple: (Predicted_Sign_Label, Softmax_Confidence, Top_3_List)
+        """
+        if not self.is_loaded:
+            return "Waiting for trained model...", 0.0, []
+
+        if frame is None or frame.size == 0:
+            return "No Hand", 0.0, []
+
+        probs = self.predict_probabilities(frame)
+        top3_indices = np.argsort(probs)[::-1][:3]
+        top3 = [(self.mapping.get_label(int(i)), float(probs[i])) for i in top3_indices]
+        label, confidence = top3[0]
+        return label, confidence, top3
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\inference\__init__.py =====
+
+# Inference package
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\models\cnn_model.py =====
+
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from typing import Tuple
+
+def build_cnn_feature_extractor(
+    input_shape: Tuple[int, int, int] = (224, 224, 3),
+    backbone: str = "MobileNetV2",
+    embedding_dim: int = 512
+) -> tf.keras.Model:
+    """
+    Builds CNN backbone for spatial feature extraction.
+    Spatial features capture hand shape, finger arrangement, and gesture position.
+    Expects raw RGB pixels in [0, 255] (same contract as model/custom_cnn.tflite) and
+    applies the scaling each backbone requires internally.
+    """
+    inputs = layers.Input(shape=input_shape)
+
+    if backbone.lower() == "mobilenetv2":
+        base_model = tf.keras.applications.MobileNetV2(
+            input_shape=input_shape,
+            include_top=False,
+            weights="imagenet"
+        )
+        base_model.trainable = False
+        # MobileNetV2 ImageNet weights expect pixels in [-1, 1]
+        x = layers.Rescaling(1.0 / 127.5, offset=-1.0)(inputs)
+        x = base_model(x)
+        x = layers.GlobalAveragePooling2D()(x)
+        outputs = layers.Dense(embedding_dim, activation="relu", name="feature_embedding")(x)
+    else:
+        # Custom CNN spatial backbone
+        x = layers.Rescaling(1.0 / 255.0)(inputs)
+        x = layers.Conv2D(32, (3, 3), activation="relu", padding="same")(x)
+        x = layers.MaxPooling2D((2, 2))(x)
+        x = layers.Conv2D(64, (3, 3), activation="relu", padding="same")(x)
+        x = layers.MaxPooling2D((2, 2))(x)
+        x = layers.Conv2D(128, (3, 3), activation="relu", padding="same")(x)
+        x = layers.MaxPooling2D((2, 2))(x)
+        x = layers.Flatten()(x)
+        outputs = layers.Dense(embedding_dim, activation="relu", name="feature_embedding")(x)
+
+    return models.Model(inputs=inputs, outputs=outputs, name="CNN_Feature_Extractor")
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\models\dynamic_model.py =====
+
+import tensorflow as tf
+from typing import Tuple
+from src.models.lstm_model import build_lstm_dynamic_model
+from src.models.gru_model import build_gru_dynamic_model
+from src.utils.logger import get_logger
+
+logger = get_logger("DynamicModelFactory")
+
+def build_dynamic_model(
+    temporal_model_type: str = "GRU",
+    sequence_length: int = 30,
+    input_shape: Tuple[int, int, int] = (224, 224, 3),
+    num_classes: int = 20,
+    backbone: str = "MobileNetV2"
+) -> tf.keras.Model:
+    """
+    Factory function for building dynamic models.
+    Supports config-driven selection between GRU and LSTM temporal architectures.
+    """
+    t_type = temporal_model_type.upper()
+    logger.info(f"Building dynamic gesture model with temporal architecture: {t_type}")
+
+    if t_type == "LSTM":
+        return build_lstm_dynamic_model(
+            sequence_length=sequence_length,
+            input_shape=input_shape,
+            num_classes=num_classes,
+            backbone=backbone
+        )
+    elif t_type == "GRU":
+        return build_gru_dynamic_model(
+            sequence_length=sequence_length,
+            input_shape=input_shape,
+            num_classes=num_classes,
+            backbone=backbone
+        )
+    else:
+        raise ValueError(f"Unsupported temporal model type '{temporal_model_type}'. Choose 'LSTM' or 'GRU'.")
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\models\gru_model.py =====
+
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from typing import Tuple
+from src.models.cnn_model import build_cnn_feature_extractor
+
+
+def build_gru_temporal_head(
+    sequence_length: int,
+    feature_dim: int,
+    num_classes: int,
+    name: str = "Dynamic_GRU_Head"
+) -> tf.keras.Model:
+    """
+    Temporal classifier over per-frame feature vectors: (Batch, T, feature_dim) -> class softmax.
+    2-layer Bidirectional GRU (128 -> 64) + Dense 128, as in the documented dynamic architecture.
+    """
+    feature_sequences = layers.Input(shape=(sequence_length, feature_dim))
+    x = layers.Bidirectional(layers.GRU(128, return_sequences=True))(feature_sequences)
+    x = layers.Dropout(0.3)(x)
+    x = layers.Bidirectional(layers.GRU(64, return_sequences=False))(x)
+    x = layers.Dropout(0.3)(x)
+    x = layers.Dense(128, activation="relu")(x)
+    outputs = layers.Dense(num_classes, activation="softmax", name="dynamic_gru_output")(x)
+    return models.Model(inputs=feature_sequences, outputs=outputs, name=name)
+
+
+def build_gru_dynamic_model(
+    sequence_length: int = 30,
+    input_shape: Tuple[int, int, int] = (224, 224, 3),
+    num_classes: int = 20,
+    backbone: str = "MobileNetV2"
+) -> tf.keras.Model:
+    """
+    Builds dynamic sign recognition model using CNN feature extraction + GRU temporal modeling.
+    Input Shape: (Batch, Sequence_Length, Height, Width, Channels).
+    """
+    sequence_inputs = layers.Input(shape=(sequence_length,) + input_shape)
+
+    cnn_extractor = build_cnn_feature_extractor(input_shape=input_shape, backbone=backbone, embedding_dim=512)
+    feature_sequences = layers.TimeDistributed(cnn_extractor)(sequence_inputs)
+
+    head = build_gru_temporal_head(sequence_length, 512, num_classes)
+    outputs = head(feature_sequences)
+
+    model = models.Model(inputs=sequence_inputs, outputs=outputs, name="Dynamic_ISL_GRU_Model")
+    return model
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\models\lstm_model.py =====
+
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from typing import Tuple
+from src.models.cnn_model import build_cnn_feature_extractor
+
+def build_lstm_dynamic_model(
+    sequence_length: int = 30,
+    input_shape: Tuple[int, int, int] = (224, 224, 3),
+    num_classes: int = 20,
+    backbone: str = "MobileNetV2"
+) -> tf.keras.Model:
+    """
+    Builds dynamic sign recognition model using CNN feature extraction + LSTM temporal modeling.
+    Input Shape: (Batch, Sequence_Length, Height, Width, Channels).
+    """
+    sequence_inputs = layers.Input(shape=(sequence_length,) + input_shape)
+
+    cnn_extractor = build_cnn_feature_extractor(input_shape=input_shape, backbone=backbone, embedding_dim=512)
+    feature_sequences = layers.TimeDistributed(cnn_extractor)(sequence_inputs)
+
+    # Temporal LSTM layers
+    x = layers.Bidirectional(layers.LSTM(128, return_sequences=True))(feature_sequences)
+    x = layers.Dropout(0.3)(x)
+    x = layers.Bidirectional(layers.LSTM(64, return_sequences=False))(x)
+    x = layers.Dropout(0.3)(x)
+
+    x = layers.Dense(128, activation="relu")(x)
+    outputs = layers.Dense(num_classes, activation="softmax", name="dynamic_lstm_output")(x)
+
+    model = models.Model(inputs=sequence_inputs, outputs=outputs, name="Dynamic_ISL_LSTM_Model")
+    return model
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\models\static_model.py =====
+
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from typing import Tuple
+from src.models.cnn_model import build_cnn_feature_extractor
+
+def build_static_model(
+    input_shape: Tuple[int, int, int] = (224, 224, 3),
+    num_classes: int = 26,
+    backbone: str = "MobileNetV2"
+) -> tf.keras.Model:
+    """
+    Builds static sign classifier model.
+    Pipeline: Input Image [0, 255] -> CNN Spatial Extractor (backbone-specific scaling) -> Dropout -> Softmax.
+    """
+    inputs = layers.Input(shape=input_shape)
+
+    extractor = build_cnn_feature_extractor(input_shape=input_shape, backbone=backbone, embedding_dim=256)
+    features = extractor(inputs)
+    
+    x = layers.Dropout(0.3)(features)
+    x = layers.Dense(128, activation="relu")(x)
+    x = layers.Dropout(0.2)(x)
+    outputs = layers.Dense(num_classes, activation="softmax", name="static_classification")(x)
+
+    model = models.Model(inputs=inputs, outputs=outputs, name="Static_ISL_Model")
+    return model
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\models\__init__.py =====
+
+# Models package
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\preprocessing\image_preprocessing.py =====
+
+import os
+import cv2
+import numpy as np
+from typing import Union
+
+def validate_image(image: np.ndarray) -> bool:
+    """Validate image format, channels, and dimensions."""
+    if not isinstance(image, np.ndarray):
+        raise TypeError(f"Image must be a numpy.ndarray, got {type(image)}")
+    if image.ndim != 3 or image.shape[2] not in (1, 3):
+        raise ValueError(f"Image array shape invalid: expected (H, W, 3/1), got {image.shape}")
+    return True
+
+def preprocess_static_image(
+    image: Union[str, np.ndarray],
+    target_size: tuple = (224, 224),
+    normalize: bool = True
+) -> np.ndarray:
+    """
+    Preprocess static sign image.
+    Pipeline: Load/Format -> Validate -> Resize (224x224) -> RGB -> Normalize [0.0, 1.0].
+    """
+    if isinstance(image, str):
+        if not os.path.exists(image):
+            raise FileNotFoundError(f"Image path not found: {image}")
+        img_bgr = cv2.imread(image)
+        if img_bgr is None:
+            raise ValueError(f"Failed to read image at: {image}")
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    elif isinstance(image, np.ndarray):
+        img_rgb = image.copy()
+        if img_rgb.ndim == 2:
+            img_rgb = cv2.cvtColor(img_rgb, cv2.COLOR_GRAY2RGB)
+    else:
+        raise TypeError(f"Unsupported image type: {type(image)}")
+
+    validate_image(img_rgb)
+
+    # Resize to target dimension
+    resized = cv2.resize(img_rgb, (target_size[1], target_size[0]), interpolation=cv2.INTER_AREA)
+
+    # Min-max normalization
+    if normalize:
+        processed = resized.astype(np.float32) / 255.0
+    else:
+        processed = resized
+
+    return processed
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\preprocessing\sequence_builder.py =====
+
+import collections
+import numpy as np
+from typing import List, Optional
+from src.preprocessing.image_preprocessing import preprocess_static_image
+
+class RollingSequenceBuffer:
+    """Rolling frame sequence buffer for real-time dynamic gesture recognition."""
+
+    def __init__(self, sequence_length: int = 30, target_size: tuple = (224, 224), normalize: bool = True):
+        self.sequence_length = sequence_length
+        self.target_size = target_size
+        self.normalize = normalize
+        self.buffer = collections.deque(maxlen=sequence_length)
+
+    def append(self, frame: np.ndarray):
+        """Preprocess single frame and append to rolling buffer."""
+        processed = preprocess_static_image(frame, target_size=self.target_size, normalize=self.normalize)
+        self.buffer.append(processed)
+
+    def is_full(self) -> bool:
+        """Check if buffer has accumulated target sequence length."""
+        return len(self.buffer) == self.sequence_length
+
+    def get_sequence_tensor(self) -> Optional[np.ndarray]:
+        """
+        Return sequence tensor of shape (sequence_length, height, width, 3).
+        If buffer is not full, pads by repeating earliest frame.
+        """
+        if len(self.buffer) == 0:
+            return None
+        frames = list(self.buffer)
+        while len(frames) < self.sequence_length:
+            frames.insert(0, frames[0].copy())
+        return np.array(frames, dtype=np.float32 if self.normalize else np.uint8)
+
+    def count(self) -> int:
+        return len(self.buffer)
+
+    def clear(self):
+        self.buffer.clear()
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\preprocessing\video_preprocessing.py =====
+
+import os
+import cv2
+import numpy as np
+from typing import Union, List
+from src.preprocessing.image_preprocessing import preprocess_static_image, validate_image
+
+def extract_frames_from_video(video_path: str) -> List[np.ndarray]:
+    """Read video file using OpenCV and extract frames as RGB numpy arrays."""
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video file not found: {video_path}")
+
+    cap = cv2.VideoCapture(video_path)
+    try:
+        if not cap.isOpened():
+            raise ValueError(f"OpenCV could not open video: {video_path}")
+
+        frames = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(frame_rgb)
+    finally:
+        cap.release()
+    if not frames:
+        raise ValueError(f"No frames extracted from video file: {video_path}")
+    return frames
+
+def sample_or_pad_sequence(frames: List[np.ndarray], target_len: int = 30) -> List[np.ndarray]:
+    """
+    Uniformly sample or pad sequence to fixed target_len frames.
+    Preserves temporal information without destroying sequence order.
+    Long clips: evenly spaced, rounded indices spanning the whole clip (as in
+    dynamic_datapreprocessing.uniform_temporal_sample). Short clips: all frames,
+    then the last frame repeated.
+    """
+    total = len(frames)
+    if total == 0:
+        raise ValueError("Frame list is empty.")
+    if target_len <= 0:
+        raise ValueError(f"target_len must be positive, got {target_len}")
+
+    if total >= target_len:
+        # Uniform temporal sampling
+        indices = np.round(np.linspace(0, total - 1, target_len)).astype(int)
+        return [frames[i] for i in indices]
+    else:
+        # Padding by extending final frame
+        sampled = list(frames)
+        last_frame = frames[-1]
+        while len(sampled) < target_len:
+            sampled.append(last_frame.copy())
+        return sampled
+
+def sample_frames_from_video(video_path: str, target_len: int) -> List[np.ndarray]:
+    """
+    Fast equivalent of sample_or_pad_sequence(extract_frames_from_video(path), target_len):
+    frames are decoded with grab() and only the sampled ones are retrieved/converted to RGB,
+    so long videos are not held in memory. Uses the container's frame count to pick the
+    indices and falls back to the full decode if that count turns out to be inaccurate.
+    """
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video file not found: {video_path}")
+    cap = cv2.VideoCapture(video_path)
+    try:
+        if not cap.isOpened():
+            raise ValueError(f"OpenCV could not open video: {video_path}")
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if n <= 0:
+            return sample_or_pad_sequence(extract_frames_from_video(video_path), target_len)
+        if n >= target_len:
+            wanted = np.round(np.linspace(0, n - 1, target_len)).astype(int)
+        else:
+            wanted = np.arange(n)
+        wanted_set = set(wanted.tolist())
+        picked = {}
+        for i in range(n):
+            if not cap.grab():
+                break
+            if i in wanted_set:
+                ok, frame = cap.retrieve()
+                if not ok:
+                    break
+                picked[i] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        exact = len(picked) == len(wanted_set) and not cap.grab()
+    finally:
+        cap.release()
+    if not exact:  # container frame count was wrong: use the reference implementation
+        return sample_or_pad_sequence(extract_frames_from_video(video_path), target_len)
+    frames = [picked[i] for i in wanted]
+    return sample_or_pad_sequence(frames, target_len) if n < target_len else frames
+
+
+def preprocess_video_sequence(
+    video_or_frames: Union[str, List[np.ndarray], np.ndarray],
+    target_len: int = 30,
+    target_size: tuple = (224, 224),
+    normalize: bool = True
+) -> np.ndarray:
+    """
+    Convert video file path or frame list into model-compatible sequence tensor.
+    Returns array of shape (target_len, target_size[0], target_size[1], 3).
+    """
+    if isinstance(video_or_frames, str):
+        raw_frames = extract_frames_from_video(video_or_frames)
+    elif isinstance(video_or_frames, list):
+        raw_frames = video_or_frames
+    elif isinstance(video_or_frames, np.ndarray):
+        if video_or_frames.ndim == 4:
+            raw_frames = [video_or_frames[i] for i in range(video_or_frames.shape[0])]
+        else:
+            raise ValueError(f"Expected 4D array for sequence input, got shape {video_or_frames.shape}")
+    else:
+        raise TypeError(f"Unsupported sequence input type: {type(video_or_frames)}")
+
+    for f in raw_frames:
+        validate_image(f)
+
+    sampled = sample_or_pad_sequence(raw_frames, target_len=target_len)
+
+    processed_frames = [
+        preprocess_static_image(f, target_size=target_size, normalize=normalize)
+        for f in sampled
+    ]
+
+    return np.array(processed_frames, dtype=np.float32 if normalize else np.uint8)
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\preprocessing\__init__.py =====
+
+# Preprocessing package
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\training\build_oneshot_gallery.py =====
+
+"""
+Build the one-shot dynamic reference gallery from Sample Videos/ (one clip per sign).
+
+Class names: the 60 classes of dynamic_video_splits.csv plus any extra class folders under
+Video_Dataset/Video_Dataset/ (e.g. "Still" -> 61), matched to clip file names
+case-insensitively (e.g. "Good morning.mp4" -> "Good Morning").
+
+Usage (from the repository root):
+    python src/training/build_oneshot_gallery.py
+"""
+
+import sys
+import os
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+
+import argparse
+from pathlib import Path
+
+import pandas as pd
+
+from src.inference.oneshot_dynamic import DEFAULT_GALLERY, build_gallery
+from src.utils.config import load_config, resolve_path
+from src.utils.logger import get_logger
+
+logger = get_logger("BuildOneShotGallery")
+
+
+def match_clips_to_classes(clip_dir: Path, class_names) -> dict:
+    """Return {class_name: clip_path}; raises if a class has no clip."""
+    clips = {p.stem.strip().lower(): p for p in clip_dir.glob("*.mp4")}
+    mapping, missing = {}, []
+    for cls in sorted(class_names):
+        path = clips.get(cls.strip().lower())
+        if path is None:
+            missing.append(cls)
+        else:
+            mapping[cls] = path
+    if missing:
+        raise FileNotFoundError(f"No reference clip in {clip_dir} for classes: {missing}")
+    unused = sorted(set(clips) - {c.strip().lower() for c in class_names})
+    if unused:
+        logger.info(f"Reference clips not in the dynamic class list (ignored): {unused}")
+    return mapping
+
+
+def main():
+    cfg = load_config()
+    parser = argparse.ArgumentParser(description="Build one-shot dynamic sign gallery")
+    parser.add_argument("--clips", default="Sample Videos")
+    parser.add_argument("--manifest", default="dynamic_video_splits.csv")
+    parser.add_argument("--dataset", default="Video_Dataset/Video_Dataset")
+    parser.add_argument("--sequence-length", type=int, default=cfg["dynamic"]["sequence_length"])
+    parser.add_argument("--out", default=DEFAULT_GALLERY)
+    args = parser.parse_args()
+
+    # Union of the manifest's 60 dynamic classes and any local dataset folders (e.g. "Still");
+    # folder names win for spelling, so labels match the training data exactly
+    classes = {c.lower(): c for c in pd.read_csv(resolve_path(args.manifest))["class_label"].unique()}
+    dataset_dir = resolve_path(args.dataset)
+    if dataset_dir.is_dir():
+        classes.update({p.name.lower(): p.name for p in dataset_dir.iterdir() if p.is_dir()})
+    classes = sorted(classes.values())
+    mapping = match_clips_to_classes(resolve_path(args.clips), classes)
+    build_gallery(mapping, args.sequence_length, resolve_path(args.out))
+
+
+if __name__ == "__main__":
+    main()
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\training\evaluate.py =====
+
+import os
+import numpy as np
+import tensorflow as tf
+from sklearn.metrics import classification_report, confusion_matrix, precision_score, recall_score, f1_score
+from src.utils.logger import get_logger
+
+logger = get_logger("EvaluateModel")
+
+def evaluate_predictions(y_true: np.ndarray, y_pred: np.ndarray, class_names: list = None):
+    """Computes and prints evaluation metrics: Accuracy, Precision, Recall, F1, and Confusion Matrix."""
+    acc = np.mean(y_true == y_pred)
+    prec = precision_score(y_true, y_pred, average="weighted", zero_division=0)
+    rec = recall_score(y_true, y_pred, average="weighted", zero_division=0)
+    f1 = f1_score(y_true, y_pred, average="weighted", zero_division=0)
+
+    print("\n==============================================")
+    print("           MODEL EVALUATION REPORT            ")
+    print("==============================================")
+    print(f"Accuracy  : {acc:.4f}")
+    print(f"Precision : {prec:.4f}")
+    print(f"Recall    : {rec:.4f}")
+    print(f"F1-Score  : {f1:.4f}")
+
+    if class_names:
+        print("\n--- Detailed Classification Report ---")
+        print(classification_report(y_true, y_pred, target_names=class_names, zero_division=0))
+
+    cm = confusion_matrix(y_true, y_pred)
+    print("\n--- Confusion Matrix ---")
+    print(cm)
+    print("==============================================\n")
+
+    return {"accuracy": acc, "precision": prec, "recall": rec, "f1_score": f1, "confusion_matrix": cm}
+
+if __name__ == "__main__":
+    logger.info("Evaluation module ready.")
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\training\evaluate_oneshot.py =====
+
+"""
+Evaluate the one-shot dynamic recognizer on the locally available Video_Dataset clips.
+
+Protocol (fixed before evaluation):
+- Gallery: one reference clip per class (Sample Videos/), 60 classes.
+- Queries: every clip under Video_Dataset/Video_Dataset/ (same recording-level split tags
+  as train_dynamic.py, for reference). Nothing is trained on these clips, so all of them are
+  unseen queries regardless of their split tag.
+- Leakage guard: a query recording (original + tilt variants share one recording id) is
+  flagged as a possible copy of its class's reference clip when any variant has the same
+  frame count as the reference AND frame-aligned similarity >= DUP_SIM. Flagged recordings
+  are excluded from the headline metrics and listed in the report.
+- Primary method: DTW similarity at T = gallery sequence length (16). The other method/T
+  combinations are reported as ablations only.
+
+Usage (from the repository root):
+    python src/training/evaluate_oneshot.py
+"""
+
+import sys
+import os
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+
+import argparse
+import json
+from pathlib import PureWindowsPath
+
+import numpy as np
+import pandas as pd
+
+from src.dataset.split_dataset import recording_id_from_path
+from src.inference.oneshot_dynamic import (
+    DEFAULT_GALLERY, FrameEncoder, OneShotDynamicRecognizer, aligned_similarity, dtw_similarity, embed_sequence,
+)
+from src.preprocessing.video_preprocessing import extract_frames_from_video
+from src.training.build_oneshot_gallery import match_clips_to_classes
+from src.training.train_dynamic import collect_local_clips
+from src.utils.config import resolve_path
+from src.utils.logger import get_logger
+
+logger = get_logger("EvaluateOneShot")
+
+DUP_SIM = 0.97
+ABLATION_T = 30
+
+
+def variant_of(path: str) -> str:
+    stem = PureWindowsPath(path).stem
+    return "left_tilt" if stem.endswith("_left_tilt") else "right_tilt" if stem.endswith("_right_tilt") else "original"
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate one-shot dynamic recognizer")
+    parser.add_argument("--dataset", default="Video_Dataset/Video_Dataset")
+    parser.add_argument("--clips", default="Sample Videos")
+    parser.add_argument("--gallery", default=DEFAULT_GALLERY)
+    parser.add_argument("--out", default="evaluation_results/dynamic_oneshot")
+    args = parser.parse_args()
+
+    out_dir = resolve_path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    encoder = FrameEncoder()
+    rec = OneShotDynamicRecognizer(args.gallery, strict=True, encoder=encoder)
+    T = rec.sequence_length
+    labels = rec.labels
+
+    # Ablation gallery at a second sequence length, built in memory from the same clips
+    clip_map = match_clips_to_classes(resolve_path(args.clips), labels)
+    # One clip at a time: holding every decoded reference frame at once needs many GB of RAM
+    ref_counts, ablation_embs = {}, []
+    for c in labels:
+        frames = extract_frames_from_video(str(clip_map[c]))
+        ref_counts[c] = len(frames)
+        ablation_embs.append(embed_sequence(encoder, frames, ABLATION_T))
+        del frames
+    gallery = {T: rec.embeddings, ABLATION_T: np.stack(ablation_embs)}
+
+    available = collect_local_clips(args.dataset)
+    available = available[available["class_label"].isin(labels)].reset_index(drop=True)
+    logger.info(f"Queries available locally: {len(available)} clips, {available['class_label'].nunique()} classes")
+
+    rows = []
+    for i, r in available.iterrows():
+        frames = extract_frames_from_video(str(r["local_path"]))
+        q = {t: embed_sequence(encoder, frames, t) for t in gallery}
+        cls_idx = labels.index(r["class_label"])
+        row = {
+            "video_path": r["video_path"], "split_tag": r["split"], "true_label": r["class_label"],
+            "variant": variant_of(r["video_path"]), "recording_id": recording_id_from_path(r["video_path"]),
+            "n_frames": len(frames),
+            "same_frame_count_as_reference": len(frames) == ref_counts[r["class_label"]],
+            "aligned_sim_to_own_reference": aligned_similarity(q[T], gallery[T][cls_idx]),
+        }
+        for t in gallery:
+            for method, fn in (("dtw", dtw_similarity), ("aligned", aligned_similarity)):
+                sims = np.array([fn(q[t], g) for g in gallery[t]])
+                order = np.argsort(sims)[::-1]
+                key = f"{method}{t}"
+                row[f"pred_{key}"] = labels[order[0]]
+                row[f"score_{key}"] = float(sims[order[0]])
+                row[f"top3_{key}"] = "|".join(labels[j] for j in order[:3])
+                row[f"rank_{key}"] = int(np.where(order == cls_idx)[0][0]) + 1
+        rows.append(row)
+        if (i + 1) % 25 == 0:
+            logger.info(f"Evaluated {i + 1}/{len(available)}")
+
+    df = pd.DataFrame(rows)
+    dup = df[df["same_frame_count_as_reference"] & (df["aligned_sim_to_own_reference"] >= DUP_SIM)]
+    flagged = sorted(dup["recording_id"].unique())
+    df["excluded_possible_reference_copy"] = df["recording_id"].isin(flagged)
+    df.to_csv(out_dir / "predictions.csv", index=False)
+
+    clean = df[~df["excluded_possible_reference_copy"]]
+    present = sorted(clean["true_label"].unique())
+    primary = f"dtw{T}"
+
+    def summarize(d, key):
+        correct = d[f"pred_{key}"] == d["true_label"]
+        per_class = d.assign(c=correct).groupby("true_label")["c"].mean()
+        return {"n": int(len(d)), "top1_accuracy": float(correct.mean()),
+                "top3_accuracy": float((d[f"rank_{key}"] <= 3).mean()),
+                "macro_recall_present_classes": float(per_class.mean()), "mean_rank": float(d[f"rank_{key}"].mean())}
+
+    metrics = {
+        "protocol": "one-shot nearest reference (1 clip/class), frozen ImageNet MobileNetV2 frame embeddings",
+        "gallery_classes": len(labels), "chance_top1": 1.0 / len(labels),
+        "primary_method": primary,
+        "queries_total": int(len(df)), "queries_after_leakage_exclusion": int(len(clean)),
+        "flagged_recordings": flagged,
+        "classes_with_queries": present,
+        "primary": summarize(clean, primary),
+        "primary_by_variant": {v: summarize(g, primary) for v, g in clean.groupby("variant")},
+        "ablations": {k: summarize(clean, k) for k in (f"aligned{T}", f"dtw{ABLATION_T}", f"aligned{ABLATION_T}")},
+        "per_class_recall_primary": clean.assign(c=clean[f"pred_{primary}"] == clean["true_label"])
+                                         .groupby("true_label")["c"].mean().round(4).to_dict(),
+    }
+    with open(out_dir / "metrics.json", "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
+
+    cm = pd.crosstab(clean["true_label"], clean[f"pred_{primary}"]).reindex(columns=labels, fill_value=0)
+    cm.to_csv(out_dir / "confusion_matrix_primary.csv")
+
+    print(json.dumps({k: metrics[k] for k in ("queries_total", "queries_after_leakage_exclusion",
+                                              "flagged_recordings", "primary", "primary_by_variant", "ablations")},
+                     indent=2))
+    logger.info(f"Wrote predictions.csv, metrics.json, confusion_matrix_primary.csv to {out_dir}")
+
+
+if __name__ == "__main__":
+    main()
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\training\train_dynamic.py =====
+
+"""
+Train the dynamic (video) sign classifier: frozen ImageNet MobileNetV2 frame features ->
+2-layer Bidirectional GRU head (src/models/gru_model.py).
+
+Data: every class folder present under Video_Dataset/Video_Dataset/ (including "Still").
+Split: recording-level 70/15/15 per class over the clips actually present
+(src.dataset.split_dataset.split_dataframe_grouped_stratified), so the original and tilt
+variants of one recording never cross splits and every class has train/val/test clips.
+The split used is saved next to the evaluation outputs. The trained classes are written to
+models/dynamic/class_mapping.json, so the model is labelled with exactly what it learned.
+
+Train/inference parity: frames are prepared bit-identically to
+src.preprocessing.video_preprocessing.preprocess_video_sequence(normalize=False), the call
+DynamicInferenceEngine makes, and the saved model takes raw [0, 255] RGB frames
+(batch, T, 224, 224, 3) end to end.
+
+Usage (from the repository root):
+    python src/training/train_dynamic.py
+"""
+
+import sys
+import os
+
+# Ensure project root is in sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+
+import argparse
+import json
+import random
+from pathlib import Path, PureWindowsPath
+
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
+
+import numpy as np
+import pandas as pd
+
+from src.dataset.split_dataset import find_cross_split_recordings, split_dataframe_grouped_stratified
+from src.preprocessing.image_preprocessing import preprocess_static_image
+from src.preprocessing.video_preprocessing import sample_frames_from_video
+# TensorFlow is imported inside the functions that need it, so the parallel video-decoding
+# worker processes (which re-import this module on Windows) start in seconds.
+from src.utils.class_mapping import ClassMappingManager
+from src.utils.config import load_config, resolve_path
+from src.utils.logger import get_logger
+
+logger = get_logger("TrainDynamic")
+
+FRAME_SIZE = (224, 224)
+
+
+def build_frozen_backbone():
+    """Raw RGB [0, 255] frame -> 1280-d MobileNetV2 (ImageNet, frozen) average-pooled features."""
+    import tensorflow as tf
+    from tensorflow.keras import layers, models
+    inputs = layers.Input(shape=FRAME_SIZE + (3,))
+    x = layers.Rescaling(1.0 / 127.5, offset=-1.0)(inputs)  # == mobilenet_v2.preprocess_input
+    base = tf.keras.applications.MobileNetV2(input_shape=FRAME_SIZE + (3,), include_top=False,
+                                             weights="imagenet", pooling="avg")
+    base.trainable = False
+    outputs = base(x, training=False)
+    model = models.Model(inputs, outputs, name="Frozen_MobileNetV2_Features")
+    model.trainable = False
+    return model
+
+
+def collect_local_clips(dataset_dir: str = "Video_Dataset/Video_Dataset", seed: int = 42) -> pd.DataFrame:
+    """All local .mp4 clips (one class per folder) with a recording-level train/val/test split."""
+    root = resolve_path(dataset_dir)
+    if not root.is_dir():
+        raise SystemExit(f"Dataset folder not found: {root}")
+    rows = [{"video_path": str(PureWindowsPath(*p.relative_to(resolve_path(".")).parts)),
+             "class_label": p.parent.name, "local_path": p}
+            for p in sorted(root.glob("*/*.mp4"))]
+    if not rows:
+        raise SystemExit(f"No .mp4 clips under {root}")
+    df = split_dataframe_grouped_stratified(pd.DataFrame(rows), random_state=seed)
+    if find_cross_split_recordings(df):
+        raise RuntimeError("Recording-level leakage in the generated split")
+    counts = df.groupby(["class_label", "split"]).size().unstack(fill_value=0)
+    thin = [c for c in counts.index if min(counts.loc[c].get(s, 0) for s in ("train", "val", "test")) == 0]
+    if thin:
+        logger.warning(f"Classes without clips in every split (too few recordings), dropped: {thin}")
+        df = df[~df["class_label"].isin(thin)]
+    return df.reset_index(drop=True)
+
+
+def _decode_sequence(path: str, seq_len: int) -> np.ndarray:
+    """
+    (T, 224, 224, 3) uint8, bit-identical to preprocess_video_sequence(path, normalize=False),
+    the call DynamicInferenceEngine makes (tests/test_dynamic_pipeline.py checks this), but
+    only the sampled frames are converted.
+    """
+    frames = sample_frames_from_video(path, seq_len)
+    return np.array([preprocess_static_image(f, target_size=FRAME_SIZE, normalize=False) for f in frames], dtype=np.uint8)
+
+
+def extract_features(df: pd.DataFrame, backbone, seq_len: int, cache: Path, workers: int = 1) -> np.ndarray:
+    """
+    (N, T, 1280) features; cached per video path + T so reruns skip decoding. Videos are
+    decoded/sampled in parallel worker processes; the frozen backbone runs in this process.
+    """
+    cached = {}
+    if cache.exists():
+        data = np.load(cache, allow_pickle=False)
+        if int(data["sequence_length"]) == seq_len:
+            cached = dict(zip([str(p) for p in data["paths"]], data["features"]))
+    todo = [(r["video_path"], str(r["local_path"])) for _, r in df.iterrows() if r["video_path"] not in cached]
+    logger.info(f"Features: {len(df) - len(todo)} cached, {len(todo)} to extract with {workers} decoder processes")
+    if todo:
+        keys, paths = [k for k, _ in todo], [p for _, p in todo]
+        if workers > 1:
+            ex = ProcessPoolExecutor(max_workers=workers)
+            sequences = ex.map(partial(_decode_sequence, seq_len=seq_len), paths, chunksize=2)
+        else:
+            ex = None
+            sequences = (_decode_sequence(p, seq_len) for p in paths)
+        try:
+            for i, (key, seq) in enumerate(zip(keys, sequences), 1):
+                cached[key] = np.asarray(backbone(seq.astype(np.float32), training=False), dtype=np.float32)
+                if i % 25 == 0 or i == len(todo):
+                    logger.info(f"Features: {i}/{len(todo)}")
+                if i % 200 == 0:  # checkpoint the cache
+                    _save_cache(cache, cached, seq_len)
+        finally:
+            if ex is not None:
+                ex.shutdown(cancel_futures=True)
+    _save_cache(cache, cached, seq_len)
+    return np.stack([cached[k] for k in df["video_path"]])
+
+
+def _save_cache(cache: Path, cached: dict, seq_len: int):
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(cache, paths=np.array(list(cached.keys())), features=np.stack(list(cached.values())),
+             sequence_length=np.int64(seq_len))
+
+
+def run_dynamic_training(config_path: str = "config.yaml", dataset_dir: str = "Video_Dataset/Video_Dataset",
+                         out_dir: str = "models/dynamic", eval_dir: str = "evaluation_results/dynamic_trained",
+                         cache: str = "features/dynamic_mobilenetv2_features.npz", epochs: int = 150,
+                         workers: int = 1, features_only: bool = False):
+    import tensorflow as tf
+    from tensorflow.keras import layers, models
+    from src.models.gru_model import build_gru_temporal_head
+
+    cfg = load_config(config_path)
+    train_cfg = cfg.get("training", {})
+    seq_len = int(cfg.get("dynamic", {}).get("sequence_length", 16))
+    seed = int(train_cfg.get("seed", 42))
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.keras.utils.set_random_seed(seed)
+
+    df = collect_local_clips(dataset_dir, seed)
+    classes = sorted(df["class_label"].unique())
+    label_to_idx = {c: i for i, c in enumerate(classes)}
+    y = df["class_label"].map(label_to_idx).to_numpy()
+    logger.info(f"Training CNN(frozen MobileNetV2) + Bi-GRU on {len(classes)} classes, T={seq_len}: {classes}")
+    logger.info("Clips per split: " + json.dumps(df["split"].value_counts().to_dict()))
+
+    backbone = build_frozen_backbone()
+    X = extract_features(df, backbone, seq_len, resolve_path(cache), workers=workers)
+    if features_only:
+        logger.info(f"Features cached for {len(df)} clips; stopping (--features-only).")
+        return None
+    idx = {s: np.where(df["split"].to_numpy() == s)[0] for s in ("train", "val", "test")}
+
+    head = build_gru_temporal_head(seq_len, X.shape[-1], len(classes))
+    head.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=float(train_cfg.get("learning_rate", 0.001))),
+                 loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+    history = head.fit(
+        X[idx["train"]], y[idx["train"]], validation_data=(X[idx["val"]], y[idx["val"]]),
+        epochs=epochs, batch_size=int(train_cfg.get("batch_size", 32)), verbose=2,
+        callbacks=[tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=20, restore_best_weights=True)],
+    )
+
+    # End-to-end inference model: raw frames -> frozen backbone per frame -> trained Bi-GRU head
+    frames_in = layers.Input(shape=(seq_len,) + FRAME_SIZE + (3,))
+    full = models.Model(frames_in, head(layers.TimeDistributed(backbone)(frames_in)), name="Dynamic_ISL_MobileNetV2_BiGRU")
+    out = resolve_path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    full.save(out / "dynamic_model.keras")
+    ClassMappingManager({i: c for c, i in label_to_idx.items()}).save_json(str(out / "class_mapping.json"))
+
+    # Held-out evaluation (test recordings never seen in training or model selection)
+    ev = resolve_path(eval_dir)
+    ev.mkdir(parents=True, exist_ok=True)
+    df[["video_path", "class_label", "split"]].to_csv(ev / "split_used.csv", index=False)
+    probs = head.predict(X[idx["test"]], verbose=0)
+    pred = probs.argmax(axis=1)
+    test_df = df.iloc[idx["test"]].assign(
+        true_label=lambda d: d["class_label"], pred_label=[classes[p] for p in pred],
+        confidence=probs.max(axis=1))[["video_path", "true_label", "pred_label", "confidence"]]
+    test_df.to_csv(ev / "predictions_test.csv", index=False)
+    pd.DataFrame(history.history).to_csv(ev / "history.csv", index_label="epoch")
+    cm = pd.crosstab(test_df["true_label"], test_df["pred_label"]).reindex(index=classes, columns=classes, fill_value=0)
+    cm.to_csv(ev / "confusion_matrix_test.csv")
+
+    from sklearn.metrics import f1_score
+    correct = test_df["true_label"] == test_df["pred_label"]
+    best_epoch = int(np.argmin(history.history["val_loss"]))
+    metrics = {
+        "model": "frozen ImageNet MobileNetV2 (per frame) + 2-layer Bi-GRU head",
+        "sequence_length": seq_len, "classes": classes, "num_classes": len(classes),
+        "chance_accuracy": 1.0 / len(classes),
+        "clips": {s: int(len(v)) for s, v in idx.items()},
+        "split": "recording-level 70/15/15 per class over locally available clips (split_used.csv)",
+        "best_epoch": best_epoch + 1, "epochs_run": len(history.history["loss"]),
+        "train_accuracy_at_best": float(history.history["accuracy"][best_epoch]),
+        "val_accuracy_at_best": float(history.history["val_accuracy"][best_epoch]),
+        "test_accuracy": float(correct.mean()),
+        "test_macro_f1": float(f1_score(test_df["true_label"], test_df["pred_label"], average="macro")),
+        "test_per_class_recall": test_df.assign(c=correct).groupby("true_label")["c"].mean().round(4).to_dict(),
+    }
+    with open(ev / "metrics.json", "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
+    logger.info("Test metrics: " + json.dumps({k: metrics[k] for k in ("clips", "test_accuracy", "test_macro_f1")}))
+    logger.info(f"Saved model to {out / 'dynamic_model.keras'} and evaluation to {ev}")
+    return metrics
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train the dynamic ISL classifier")
+    parser.add_argument("--epochs", type=int, default=150)
+    parser.add_argument("--workers", type=int, default=1, help="parallel video-decoding processes (1 = in-process)")
+    parser.add_argument("--features-only", action="store_true", help="only extract/cache features")
+    args = parser.parse_args()
+    run_dynamic_training(epochs=args.epochs, workers=args.workers, features_only=args.features_only)
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\training\train_static.py =====
+
+import sys
+import os
+
+# Ensure project root is in sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+
+import tensorflow as tf
+from src.utils.config import load_config
+from src.utils.class_mapping import ClassMappingManager
+from src.utils.logger import get_logger
+from src.dataset.dataset_loader import load_static_tensorflow_datasets
+from src.models.static_model import build_static_model
+
+logger = get_logger("TrainStatic")
+
+def run_static_training(config_path: str = "config.yaml"):
+    cfg = load_config(config_path)
+    train_cfg = cfg.get("training", {})
+    prep_cfg = cfg.get("preprocessing", {})
+    model_cfg = cfg.get("model", {})
+
+    train_dir = "Dataset/Training"
+    val_dir = "Dataset/Validation"
+    test_dir = "Dataset/Testing"
+
+    if not os.path.exists(train_dir):
+        logger.error(f"Training dataset directory not found at {train_dir}")
+        return
+
+    tf.random.set_seed(train_cfg.get("seed", 42))
+    batch_size = train_cfg.get("batch_size", 32)
+    epochs = train_cfg.get("epochs", 30)
+    img_size = (prep_cfg.get("image_height", 224), prep_cfg.get("image_width", 224))
+
+    train_ds, val_ds, test_ds, class_names = load_static_tensorflow_datasets(
+        train_dir, val_dir, test_dir, img_size=img_size, batch_size=batch_size
+    )
+
+    # Save class mapping
+    out_dir = "models/static"
+    os.makedirs(out_dir, exist_ok=True)
+    mapping_mgr = ClassMappingManager.from_list(class_names)
+    mapping_mgr.save_json(os.path.join(out_dir, "class_mapping.json"))
+
+    model = build_static_model(
+        input_shape=img_size + (3,),
+        num_classes=len(class_names),
+        backbone=model_cfg.get("backbone", "MobileNetV2")
+    )
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=train_cfg.get("learning_rate", 0.001)),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"]
+    )
+
+    logger.info("Starting static model training...")
+    history = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=epochs
+    )
+
+    model_path = os.path.join(out_dir, "static_model.keras")
+    model.save(model_path)
+    logger.info(f"Static model successfully trained and saved to {model_path}")
+
+if __name__ == "__main__":
+    run_static_training()
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\training\__init__.py =====
+
+# Training package
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\utils\class_mapping.py =====
+
+import os
+import json
+from typing import Dict, List, Optional
+from src.utils.logger import get_logger
+
+logger = get_logger("ClassMapping")
+
+class ClassMappingManager:
+    """Manages class ID <-> Label mappings for static and dynamic models."""
+    
+    def __init__(self, mapping_dict: Optional[Dict[int, str]] = None):
+        self.idx_to_label: Dict[int, str] = mapping_dict if mapping_dict else {}
+        self.label_to_idx: Dict[str, int] = {v: int(k) for k, v in self.idx_to_label.items()}
+
+    @classmethod
+    def from_list(cls, label_list: List[str]):
+        mapping = {idx: label for idx, label in enumerate(sorted(label_list))}
+        return cls(mapping)
+
+    def save_json(self, filepath: str):
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump({str(k): v for k, v in self.idx_to_label.items()}, f, indent=4)
+        logger.info(f"Saved class mapping ({len(self.idx_to_label)} classes) to {filepath}")
+
+    @classmethod
+    def load_json(cls, filepath: str):
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"Class mapping file not found at {filepath}")
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        mapping = {int(k): v for k, v in data.items()}
+        logger.info(f"Loaded class mapping ({len(mapping)} classes) from {filepath}")
+        return cls(mapping)
+
+    def get_label(self, idx: int) -> str:
+        return self.idx_to_label.get(idx, "Unknown")
+
+    def get_idx(self, label: str) -> int:
+        return self.label_to_idx.get(label, -1)
+
+    def num_classes(self) -> int:
+        return len(self.idx_to_label)
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\utils\config.py =====
+
+import copy
+from pathlib import Path
+from typing import Any, Dict, Union
+from src.utils.logger import get_logger
+
+try:
+    import yaml
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
+
+logger = get_logger("ConfigLoader")
+
+# Repository root (the folder containing src/, config.yaml and model/)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# Kept in sync with config.yaml so a missing file does not silently change behaviour
+DEFAULT_CONFIG = {
+    "camera": {"index": 0, "width": 640, "height": 480, "fps": 30},
+    "preprocessing": {"image_width": 224, "image_height": 224, "channels": 3, "normalization": True},
+    "dynamic": {"sequence_length": 16, "inference_interval": 3,
+                "live_method": "trained", "oneshot_gallery": "models/dynamic_oneshot/gallery.npz",
+                "live_window_seconds": 4.0, "live_match_every_seconds": 1.0},
+    "model": {"backbone": "CustomCNN", "temporal_model": "GRU"},
+    "inference": {"confidence_threshold": 0.40, "smoothing": True, "smoothing_window_size": 5},
+    "training": {"batch_size": 32, "epochs": 30, "learning_rate": 0.001, "seed": 42}
+}
+
+
+def resolve_path(path: Union[str, Path]) -> Path:
+    """Resolve a relative path against the CWD if it exists there, otherwise against PROJECT_ROOT."""
+    p = Path(path)
+    if p.is_absolute() or p.exists():
+        return p
+    return PROJECT_ROOT / p
+
+
+def load_config(config_path: str = "config.yaml") -> Dict[str, Any]:
+    """Loads configuration from YAML file (merged over defaults) or returns defaults."""
+    defaults = copy.deepcopy(DEFAULT_CONFIG)
+    path = resolve_path(config_path)
+    if not HAS_YAML:
+        logger.warning("PyYAML not installed. Falling back to default configuration.")
+        return defaults
+    if not path.exists():
+        logger.warning(f"Config file not found at {path}. Falling back to default settings.")
+        return defaults
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError) as e:
+        logger.error(f"Error reading config file {path}: {e}. Falling back to default settings.")
+        return defaults
+    logger.info(f"Loaded configuration from {path}")
+    for section, values in cfg.items():
+        if isinstance(values, dict) and isinstance(defaults.get(section), dict):
+            defaults[section].update(values)
+        else:
+            defaults[section] = values
+    return defaults
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\utils\logger.py =====
+
+import logging
+import sys
+
+def get_logger(name: str = "ISL_System") -> logging.Logger:
+    """Configures and returns a standardized system logger."""
+    logger = logging.getLogger(name)
+    if not logger.handlers:
+        logger.setLevel(logging.INFO)
+        formatter = logging.Formatter(
+            '[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setFormatter(formatter)
+        logger.addHandler(ch)
+    return logger
+
+===== C:\Users\reddy\OneDrive\Desktop\Indian-Sign-Language-Detection-main\src\utils\__init__.py =====
+
+# Utils package
+
+===== config.yaml =====
+
+# ISL Recognition System Central Configuration
+
+camera:
+  index: 0
+  width: 640
+  height: 480
+  fps: 30
+
+preprocessing:
+  image_width: 224
+  image_height: 224
+  channels: 3
+  normalization: true
+
+dynamic:
+  sequence_length: 16          # frames per clip (T=16); stored in the one-shot gallery
+  inference_interval: 3
+  live_method: trained         # trained (Bi-GRU, 61 signs; 139/140 held-out) | oneshot (61 signs, 24.2% top-1)
+  oneshot_gallery: models/dynamic_oneshot/gallery.npz
+  live_window_seconds: 4.0     # live webcam clip length matched against the gallery
+  live_match_every_seconds: 1.0
+
+model:
+  backbone: CustomCNN
+  temporal_model: GRU  # Switchable: GRU or LSTM
+
+inference:
+  confidence_threshold: 0.40
+  smoothing: true
+  smoothing_window_size: 5
+
+training:
+  batch_size: 32
+  epochs: 30
+  learning_rate: 0.001
+  seed: 42
+
+actions:                       # hold a static sign to open an app/website (http(s):// or whatsapp: only)
+  enabled: true
+  hold_seconds: 1.0
+  cooldown_seconds: 5.0
+  min_confidence: 0.70
+  signs:
+    W: {name: WhatsApp, url: "https://web.whatsapp.com"}
+    Y: {name: YouTube, url: "https://www.youtube.com"}
+    L: {name: Google, url: "https://www.google.com"}
+
+===== config.yaml =====
+
+# ISL Recognition System Central Configuration
+
+camera:
+  index: 0
+  width: 640
+  height: 480
+  fps: 30
+
+preprocessing:
+  image_width: 224
+  image_height: 224
+  channels: 3
+  normalization: true
+
+dynamic:
+  sequence_length: 16          # frames per clip (T=16); stored in the one-shot gallery
+  inference_interval: 3
+  live_method: trained         # trained (Bi-GRU, 61 signs; 139/140 held-out) | oneshot (61 signs, 24.2% top-1)
+  oneshot_gallery: models/dynamic_oneshot/gallery.npz
+  live_window_seconds: 4.0     # live webcam clip length matched against the gallery
+  live_match_every_seconds: 1.0
+
+model:
+  backbone: CustomCNN
+  temporal_model: GRU  # Switchable: GRU or LSTM
+
+inference:
+  confidence_threshold: 0.40
+  smoothing: true
+  smoothing_window_size: 5
+
+training:
+  batch_size: 32
+  epochs: 30
+  learning_rate: 0.001
+  seed: 42
+
+actions:                       # hold a static sign to open an app/website (http(s):// or whatsapp: only)
+  enabled: true
+  hold_seconds: 1.0
+  cooldown_seconds: 5.0
+  min_confidence: 0.70
+  signs:
+    W: {name: WhatsApp, url: "https://web.whatsapp.com"}
+    Y: {name: YouTube, url: "https://www.youtube.com"}
+    L: {name: Google, url: "https://www.google.com"}
