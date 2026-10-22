@@ -1,9 +1,10 @@
 # Indian Sign Language Detection
 
-Real-time recognition of **Indian Sign Language (ISL)** from a standard webcam.
-The system recognises **static signs** (the A–Z alphabet and finger-counted numbers 0–5) and
-**dynamic signs** (61 words and phrases such as *Hello*, *Thank you* and *Good Morning*),
-combining MediaPipe hand tracking with deep-learning models in a single OpenCV desktop application.
+Real-time **Indian Sign Language (ISL)** recognition from a standard webcam, built with MediaPipe hand tracking and deep learning in an OpenCV desktop app.
+
+- **Static signs:** A–Z alphabet and finger-counted numbers 0–5
+- **Dynamic signs:** 61 words and phrases (*Hello*, *Thank you*, *Good Morning*, ...)
+- **Runs offline on CPU:** no GPU, server or internet needed
 
 ![Python](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)
 ![TensorFlow](https://img.shields.io/badge/TensorFlow-2.21-FF6F00?logo=tensorflow&logoColor=white)
@@ -13,33 +14,14 @@ combining MediaPipe hand tracking with deep-learning models in a single OpenCV d
 
 ---
 
-## Table of Contents
-
-- [Features](#features)
-- [How It Works](#how-it-works)
-- [Results](#results)
-- [Getting Started](#getting-started)
-- [Usage](#usage)
-- [Configuration](#configuration)
-- [Testing](#testing)
-- [Retraining the Models](#retraining-the-models)
-- [Project Structure](#project-structure)
-- [Limitations](#limitations)
-- [Troubleshooting](#troubleshooting)
-- [Author](#author)
-
----
-
 ## Features
 
-- **Static sign recognition** – live A–Z alphabet recognition, supporting both one- and two-handed signs.
-- **Number mode** – counts raised fingers (0–5) on one hand.
-- **Dynamic sign recognition** – classifies the last ~4 seconds of video into one of 61 ISL words and phrases.
-- **Sign shortcuts** – hold a sign for one second to open an app or website (e.g. **W** → WhatsApp, **Y** → YouTube, **L** → Google).
-- **Guided self-tests** – step-by-step A–Z and 0–5 webcam tests that save results to CSV.
-- **Runs offline on CPU** – no GPU, web server or internet connection required.
-
----
+- Live A–Z recognition, one- and two-handed signs
+- Number mode: counts raised fingers (0–5)
+- Dynamic recognition: classifies the last ~4 seconds of video into 61 signs
+- Sign shortcuts: hold **W** (WhatsApp), **Y** (YouTube) or **L** (Google) for 1 second
+- Guided A–Z and 0–5 webcam self-tests that save results to CSV
+- Dataset integrity checks for duplicates, label conflicts and leakage
 
 ## How It Works
 
@@ -47,54 +29,40 @@ combining MediaPipe hand tracking with deep-learning models in a single OpenCV d
 
 ```
 Webcam frame ─► MediaPipe hand landmarks ─┬─► Geometric rule classifier ─┐
-                                          └─► Hand crop ─► Custom CNN ───┴─► Fusion + smoothing ─► Letter
+                                          └─► Hand crop ─► CNN ──────────┴─► CNN-first fusion + smoothing ─► Letter
 ```
 
-- **Hand tracking:** MediaPipe Gesture Recognizer (`gesture_recognizer.task`) detects up to two hands.
-- **CNN:** a custom convolutional network (3× Conv2D → Dense 128 → Dense 26, softmax), exported to
-  TensorFlow Lite (`model/custom_cnn.tflite`). Input: 224×224 RGB.
-- **Rules:** landmark geometry provides an independent prediction for a subset of letters when a single hand is visible.
-- **Smoothing:** predictions are averaged over a short window to keep the output stable.
+- **Hand tracking:** MediaPipe Gesture Recognizer (`gesture_recognizer.task`), up to two hands.
+- **CNN:** exported to TensorFlow Lite (`model/custom_cnn.tflite`). Input 224×224 RGB, output 26-way softmax (A–Z).
+- **Rules:** hand geometry gives a fallback prediction for some letters (e.g. open hand → B, fist → A).
+- **Fusion (CNN first):** if the CNN is at least 50% confident its letter is used; the rules only apply when the CNN is unsure.
+- **Smoothing:** predictions are averaged over a short window for a stable output.
 
 ### Dynamic signs (words and phrases)
 
 ```
-Last ~4 s of video ─► 16 uniformly sampled frames ─► MobileNetV2 (frozen, per frame) ─► 2-layer Bi-GRU ─► Softmax (61 signs)
+Last ~4 s of video ─► 16 sampled frames ─► MobileNetV2 (frozen) ─► 2-layer Bi-GRU ─► Softmax (61 signs)
 ```
 
-- **Trained model (default):** `models/dynamic/dynamic_model.keras` — ImageNet MobileNetV2 features feed a
-  bidirectional GRU (128 → 64 units). Inference runs on a background thread once per second.
-- **One-shot model (alternative):** `models/dynamic_oneshot/gallery.npz` — matches the live clip against one
-  reference video per sign using MobileNetV2 features and dynamic time warping. No training required.
-
----
+- **Default model:** `models/dynamic/dynamic_model.keras` (MobileNetV2 features → Bi-GRU 128 → 64 units).
+- **Alternative:** one-shot matching with dynamic time warping against one reference video per sign (`models/dynamic_oneshot/`).
 
 ## Results
 
 | Model | Evaluation | Result |
 | :--- | :--- | :--- |
-| Dynamic — MobileNetV2 + Bi-GRU | Held-out test set, 140 clips, 61 classes | **99.3 % accuracy** (139 / 140), macro-F1 **0.978** |
-| Dynamic — one-shot (DTW) | 240 clips, 61 classes | 24.2 % top-1 (chance: 1.7 %) |
+| Dynamic: MobileNetV2 + Bi-GRU | Held-out test set, 140 clips, 61 classes | **99.3% accuracy** (139/140), macro-F1 **0.978** |
+| Dynamic: one-shot (DTW) | 240 clips, 61 classes | 24.2% top-1 (chance 1.7%) |
 
-Dynamic training data: 1,043 clips split at recording level into 760 train / 143 validation / 140 test.
-The best checkpoint was reached at epoch 49 (validation accuracy 97.2 %). Full metrics, per-class
-recall, confusion matrix and predictions are in [`evaluation_results/dynamic_trained/`](evaluation_results/dynamic_trained/).
+Dynamic data: 1,043 clips split by recording into 760 train / 143 validation / 140 test. Full metrics are in
+[`evaluation_results/dynamic_trained/`](evaluation_results/dynamic_trained/).
 
-> **Note:** the test recordings are from the same signers and environment as the training data, so the
-> 99.3 % figure reflects within-session performance. Expect lower accuracy for new signers, lighting and
-> backgrounds. See [Limitations](#limitations).
-
----
+> The test clips share signers and environment with the training data, so 99.3% is within-session performance.
+> Expect lower accuracy for new signers, lighting and backgrounds.
 
 ## Getting Started
 
-### Prerequisites
-
-- Windows 10/11, macOS or Linux (verified on **Windows 11**)
-- **Python 3.13** (verified with 3.13.5)
-- A webcam
-
-### Installation
+**Requirements:** Windows 10/11, macOS or Linux (verified on Windows 11), Python 3.13, a webcam.
 
 ```bash
 git clone https://github.com/saisharatkaruturi/Indian-Sign-Language-Detection.git
@@ -107,145 +75,119 @@ python -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
-> The first launch can take 1–3 minutes while TensorFlow and MediaPipe initialise. Later launches start in a few seconds.
-
----
+The first launch can take 1–3 minutes while TensorFlow and MediaPipe initialise.
 
 ## Usage
 
-Run all commands from the repository root.
+Run from the repository root.
 
 ```bash
 python src/main.py                       # interactive menu
 python src/main.py --mode static         # live A–Z recognition
 python src/main.py --mode dynamic        # live word/phrase recognition
-python src/main.py --mode camera_test    # check that the webcam works
-python src/main.py --mode letter_test    # guided A–Z test (results saved to evaluation_results/live_tests/)
-python src/main.py --mode number_test    # guided 0–5 finger-count test
+python src/main.py --mode camera_test    # check the webcam
+python src/main.py --mode letter_test    # guided A–Z test
+python src/main.py --mode number_test    # guided 0–5 test
 ```
-
-### Keyboard controls
 
 | Key | Action |
 | :---: | :--- |
 | `Q` | Quit |
 | `M` | Toggle mirrored view |
-| `C` | Clear the recognised sequence |
+| `C` | Clear recognised sequence |
 | `N` | Toggle number mode (0–5) |
 
-### Sign shortcuts
-
-Hold one of these letters for one second (5-second cooldown):
-
-| Sign | Opens |
-| :---: | :--- |
-| **W** | WhatsApp Web |
-| **Y** | YouTube |
-| **L** | Google |
-
----
-
-## Configuration
-
-All runtime settings live in [`config.yaml`](config.yaml).
-
-| Section | Key settings |
-| :--- | :--- |
-| `camera` | `index`, resolution, FPS |
-| `dynamic` | `live_method` (`trained` or `oneshot`), `sequence_length` (16), `live_window_seconds` |
-| `inference` | `confidence_threshold`, smoothing window |
-| `actions` | enable/disable sign shortcuts and edit their targets (only `http(s)://` and `whatsapp:` URLs are accepted) |
-
----
+Settings (camera, dynamic method, confidence threshold, shortcuts) are in [`config.yaml`](config.yaml).
 
 ## Testing
 
 ```bash
-python -m pytest -v            # full suite: unit, model and integration tests
+python -m pytest -v            # unit, model and integration tests
 python integration_tests.py    # preprocessing-contract tests only
 ```
 
-The suite covers preprocessing, both inference engines, the shipped models, number mode, sign shortcuts and
-the live-test recorder. Tests that need hardware or data that is not present are skipped automatically.
+## Data Quality Checks
 
----
+Needs the static dataset at `Dataset/Training`, `Dataset/Validation` and `Dataset/Testing` (one folder per letter).
+
+```bash
+python check_leak.py     # images per split and identical images shared across splits
+python check_dupes.py    # duplicates, same image under different letters, leakage -> dupes_report.csv
+```
 
 ## Retraining the Models
 
-The dynamic training dataset (`Video_Dataset/`) is not included in this repository because of its size.
-Place it in the repository root, then run:
+### Static A–Z model
 
 ```bash
-python src/training/train_dynamic.py           # train MobileNetV2 + Bi-GRU on Video_Dataset/
-python src/training/build_oneshot_gallery.py   # rebuild the one-shot gallery from Sample Videos/
-python src/training/evaluate_oneshot.py        # evaluate the one-shot matcher
+python train_fast.py                                        # fast: frozen MobileNetV2 features + small classifier
+python train_static_v2.py --head-epochs 5 --finetune-epochs 8   # full: head training + fine-tuning + augmentation
+python diagnose_cnn.py --model model\custom_cnn_new.tflite
 ```
 
-Training writes the model to `models/dynamic/` and the evaluation report to `evaluation_results/dynamic_trained/`.
+| Script | Approach |
+| :--- | :--- |
+| `train_fast.py` | Extracts MobileNetV2 features once, then trains a small classifier. **Stage A** trains on Training only and reports held-out Validation/Testing accuracy. **Stage B** retrains on all splits for export |
+| `train_static_v2.py` | MobileNetV2 head training, then fine-tuning of the top 40 layers, with zoom/shift/rotation/brightness/contrast/RGB↔BGR augmentation |
 
----
+Both write `model/custom_cnn_new.tflite` and never overwrite `model/custom_cnn.tflite`. To use it, back up the old
+model and copy the new one over it. The export takes raw 0–255 float32 pixels.
+
+> The model exported by `train_fast.py` has seen the Testing images (Stage B), so only its Stage A numbers are held-out.
+
+### Dynamic model
+
+Place `Video_Dataset/` in the repository root, then:
+
+```bash
+python src/training/train_dynamic.py
+python src/training/build_oneshot_gallery.py
+python src/training/evaluate_oneshot.py
+```
 
 ## Project Structure
 
 ```
-Indian-Sign-Language-Detection/
-├── src/
-│   ├── main.py                    # Application entry point and mode menu
-│   ├── camera/                    # Webcam access and camera test
-│   ├── dataset/                   # Dataset loading, validation and leakage-free splitting
-│   ├── inference/                 # Static/dynamic engines, real-time pipeline, shortcuts, live tests
-│   ├── models/                    # CNN, GRU and LSTM model definitions
-│   ├── preprocessing/             # Image, video and frame-sequence preprocessing
-│   ├── training/                  # Training, gallery building and evaluation scripts
-│   └── utils/                     # Configuration, logging and class mappings
-├── model/
-│   └── custom_cnn.tflite          # Static A–Z CNN (TensorFlow Lite)
-├── models/
-│   ├── static/                    # Static class mapping (A–Z)
-│   ├── dynamic/                   # Trained Bi-GRU model + class mapping (61 signs)
-│   └── dynamic_oneshot/           # One-shot reference gallery
-├── Sample Videos/                 # One reference clip per dynamic sign (61 videos)
-├── evaluation_results/            # Saved metrics and live-test results
-├── data_pipeline/                 # Reusable preprocessing contracts
-├── integration/                   # Mock recognisers used by the contract tests
-├── tests/                         # Pytest suite
-├── gesture_recognizer.task        # MediaPipe hand-tracking model
-├── dynamic_video_splits.csv       # Recording-level train/val/test manifest
-├── config.yaml                    # Runtime configuration
-├── integration_tests.py           # Data-contract tests
+├── src/                     # main.py, camera, dataset, inference, models, preprocessing, training, utils
+├── model/                   # custom_cnn.tflite (static A–Z CNN)
+├── models/                  # static mapping, dynamic Bi-GRU model, one-shot gallery
+├── Dataset/                 # static image dataset (not included)
+├── Sample Videos/           # one reference clip per dynamic sign (61)
+├── evaluation_results/      # saved metrics and live-test results
+├── data_pipeline/           # reusable preprocessing contracts
+├── integration/             # mock recognisers for contract tests
+├── tests/                   # pytest suite
+├── train_fast.py            # fast static retraining
+├── train_static_v2.py       # static retraining with fine-tuning
+├── diagnose_cnn.py          # static model diagnostics
+├── check_leak.py            # cross-split leakage check
+├── check_dupes.py           # duplicate and label-conflict report
+├── patch_translator.py      # applies the CNN-first fusion fix
+├── gesture_recognizer.task  # MediaPipe hand-tracking model
+├── config.yaml              # runtime configuration
+├── integration_tests.py
 ├── pytest.ini
 └── requirements.txt
 ```
 
----
-
 ## Limitations
 
-- **Signer independence is not yet measured.** The dynamic test set shares signers and recording sessions
-  with the training set; performance on new users will be lower than the reported 99.3 %.
-- **Partial dynamic dataset.** The model was trained on 1,043 of the 2,723 available clips, with 1–8 test clips per sign.
-- **One-shot matching is weak** (24.2 % top-1) and is intended only as a fallback for signs the trained model does not know.
-- **Numbers 6–9** (two-handed in ISL) are not supported; number mode covers 0–5 only.
-- **Rule-based confidences** for the geometric classifier are fixed values, not calibrated probabilities.
-- **Static model accuracy** has not been re-measured on a held-out set in this repository, because the static image dataset is not included.
-
----
+- Signer independence is not measured; dynamic test clips share signers with the training data.
+- The dynamic model used 1,043 of 2,723 available clips, with 1–8 test clips per sign.
+- One-shot matching is weak (24.2% top-1) and is only a fallback.
+- Numbers 6–9 (two-handed in ISL) are not supported.
+- Rule-based confidences are fixed values, not calibrated probabilities.
+- Static accuracy is not measured in this repository by default because the image dataset is not included;
+  reproduce it with `train_fast.py` (Stage A) or `train_static_v2.py`.
+- Static datasets can contain duplicates or train/test leakage. Run the data quality checks before trusting any accuracy figure.
 
 ## Troubleshooting
 
 | Problem | Solution |
 | :--- | :--- |
-| `ModuleNotFoundError: mediapipe` | Activate the virtual environment and reinstall `requirements.txt`. |
-| `cv2` import errors | Install only `opencv-contrib-python` (pinned in `requirements.txt`); uninstall `opencv-python` if present. |
-| Camera does not open | Close other applications using the webcam, or change `camera.index` in `config.yaml`. |
-| `Static CNN not loaded (...)` | Check that `model/custom_cnn.tflite` and `models/static/class_mapping.json` exist. |
-| `tf.lite.Interpreter is deprecated` warning | Harmless. Install `ai-edge-litert` to use the newer interpreter automatically. |
-| Slow first start | Expected on a fresh environment (TensorFlow/MediaPipe initialisation and antivirus scanning). |
-
----
-
-## Author
-
-Developed by [@saisharatkaruturi](https://github.com/saisharatkaruturi).
-
-If you find this project useful, consider giving it a ⭐.
+| `ModuleNotFoundError: mediapipe` | Activate the virtual environment and reinstall `requirements.txt` |
+| `cv2` import errors | Install only `opencv-contrib-python`; uninstall `opencv-python` |
+| Camera does not open | Close other apps using the webcam, or change `camera.index` in `config.yaml` |
+| `Static CNN not loaded` | Check that `model/custom_cnn.tflite` and `models/static/class_mapping.json` exist |
+| Letters like A, B, D, V predicted wrongly | Run `python patch_translator.py` (backup saved as `gesture_translator.py.bak`) |
+| `Folder not found` when training | Put the dataset in `Dataset/Training`, `Validation`, `Testing` and run from the repo root |
